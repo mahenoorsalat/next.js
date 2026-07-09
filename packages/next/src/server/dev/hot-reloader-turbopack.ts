@@ -474,6 +474,15 @@ export async function createHotReloaderTurbopack(
   // Dev specific
   const changeSubscriptions: ChangeSubscriptions = new Map()
   const serverPathState = new Map<string, string>()
+  // The set of server paths written for each edge entry on its previous
+  // `writeToDisk()`. Edge module contexts are cached under a stable module
+  // name and are only evicted by `clearModuleContext(path)` when the path
+  // matches a chunk the live context already loaded. When an edit renames
+  // every one of an edge entry's content-hashed chunks, none of the new paths
+  // match the stale context, so it would never be evicted. Remembering the
+  // previous paths lets us evict via the paths that are being *removed*, which
+  // are exactly the ones the stale context loaded.
+  const edgeServerPaths = new Map<EntryKey, string[]>()
   const readyIds: ReadyIds = new Set()
   let currentEntriesHandlingResolve: ((value?: unknown) => void) | undefined
   let currentEntriesHandling = new Promise(
@@ -607,7 +616,33 @@ export async function createHotReloaderTurbopack(
       }
 
       if (!hasChange) {
-        return false
+        // For non-edge entries, no content change means there is nothing to do.
+        if (writtenEndpoint.type !== 'edge') {
+          return false
+        }
+
+        // Edge entries cache a sandbox module context under a stable module
+        // name, so it must be evicted when the entry's chunks are renamed. A
+        // rename is not observed as a content change above (a new chunk path
+        // simply has no prior hash to compare against), so detect it here as a
+        // chunk path that was loaded previously but is no longer emitted. Only
+        // then is eviction needed: fall through to the edge eviction below.
+        //
+        // When nothing was renamed, the live context is still valid and must be
+        // preserved — tearing it down on an unchanged rebuild would wipe
+        // in-memory module state that has to survive across requests (e.g. a
+        // streaming route handler holding the stream primed by a prior request).
+        const currentRelativePaths = new Set(
+          writtenEndpoint.serverPaths.map(({ path: p }) => p)
+        )
+        const previousRelativePaths = edgeServerPaths.get(key)
+        const hasRenamedChunk =
+          !!previousRelativePaths &&
+          previousRelativePaths.some((p) => !currentRelativePaths.has(p))
+        if (!hasRenamedChunk) {
+          edgeServerPaths.set(key, [...currentRelativePaths])
+          return false
+        }
       }
     }
 
@@ -629,6 +664,30 @@ export async function createHotReloaderTurbopack(
       serverFastRefresh &&
       entryType === 'app' &&
       writtenEndpoint.type !== 'edge'
+
+    // Evict the edge module context for chunks that this edge entry loaded
+    // previously but no longer emits. An edge context is cached under a stable
+    // module name and `clearModuleContext(path)` only evicts it when `path`
+    // matches a chunk the live context already loaded. When an edit renames
+    // every content-hashed chunk of the entry, none of the new `serverPaths`
+    // match the stale context, so without this it would keep serving the old
+    // module. The removed paths are exactly the ones the stale context loaded,
+    // so clearing them evicts it. Only relevant for edge entries; for Node.js
+    // entries the module is re-`require()`d from its new path anyway.
+    if (writtenEndpoint.type === 'edge') {
+      const currentRelativePaths = new Set(
+        writtenEndpoint.serverPaths.map(({ path: p }) => p)
+      )
+      const previousRelativePaths = edgeServerPaths.get(key)
+      if (previousRelativePaths) {
+        for (const previousPath of previousRelativePaths) {
+          if (!currentRelativePaths.has(previousPath)) {
+            clearModuleContext(join(distDir, previousPath))
+          }
+        }
+      }
+      edgeServerPaths.set(key, [...currentRelativePaths])
+    }
 
     const serverChunksPrefix = SERVER_HMR_CHUNKS_DIR + sep
     const filesToDelete: string[] = []
