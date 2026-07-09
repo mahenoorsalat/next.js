@@ -2420,27 +2420,24 @@ async fn get_source_map_rope(
         // chunks.
         map = container.get_source_map(client_path, module.clone());
         if !map.await?.is_content() {
-            // HACK: An older revision of a chunk's sourcemap may be requested by an HMR client. We
-            // remove stale entries from the VersionStateMap but a client may be holding onto a
-            // reference to a stale chunk and requesting its sourcmemap via the error
-            // overlay.
-            //
-            // This exists because we don't have logic for the server hmr client to mark which
-            // chunks it's no longer using.
-            //
-            // Fall back to reading from the filesystem.
-            //
-            // In the future, the VersionStateMap should track _modules_ rather than chunks, which
-            // can be observed over time in a stable way, unlike chunks
-            // let map_relative = format!("{chunk_base_unix}.map");
-            // let server_map = node_root.join(&map_relative)?.read();
-            // if server_map.await?.is_content() {
-            //     return Ok(server_map);
-            // }
-            // let client_map = client_relative_path.join(&map_relative)?.read();
-            // if client_map.await?.is_content() {
-            //     return Ok(client_map);
-            // }
+            // The chunk may have been superseded by a rename: when a sibling
+            // module in a chunk changes, the chunk's availability hash (and
+            // thus its filename) changes, so the old path is dropped from the
+            // `VersionedContentMap`. A module that was preserved across that
+            // update — its own code unchanged, so it was never re-evaluated —
+            // keeps running from, and reports stack frames into, the old chunk.
+            // The emitted `.map` sidecar of the old chunk is not deleted from
+            // the output directory, so read it directly to keep those frames
+            // source-mapped instead of losing the mapping to the renamed chunk.
+            let map_relative = format!("{chunk_base_unix}.map");
+            let server_map = node_root.join(&map_relative)?.read();
+            if server_map.await?.is_content() {
+                return Ok(server_map);
+            }
+            let client_map = client_relative_path.join(&map_relative)?.read();
+            if client_map.await?.is_content() {
+                return Ok(client_map);
+            }
             bail!("chunk/module {sys_path:?} (module: {module:?}) is missing a sourcemap");
         }
     }
