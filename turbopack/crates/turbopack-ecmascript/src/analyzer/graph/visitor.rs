@@ -29,6 +29,7 @@ use crate::{
         graph::{ConditionalKind, Effect, EffectArg, EffectsBlock, EvalContext, VarGraph},
         is_unresolved_id,
     },
+    chunk::CjsStaticExports,
     code_gen::CodeGen,
     references::{
         AstPath,
@@ -105,6 +106,9 @@ struct CjsExportsCollector {
     writes: Vec<DroppableCjsExportAssignment>,
     /// Whether the `exports.__esModule = true` interop marker is set.
     has_es_module: bool,
+    /// Whether the module body contains a top-level `return`, which skips every
+    /// write that follows it.
+    has_top_level_return: bool,
 }
 
 trait FunctionLike {
@@ -658,21 +662,41 @@ mod analyzer_state {
             }
         }
 
+        /// Records a `return` in the module body, which exits the module early.
+        pub(super) fn set_cjs_has_top_level_return(&mut self) {
+            if let Some(c) = &mut self.state.cjs_exports {
+                c.has_top_level_return = true;
+            }
+        }
+
         pub(super) fn record_cjs_export(&mut self, name: RcStr, path: AstPath) {
             if let Some(c) = &mut self.state.cjs_exports {
                 c.writes.push(DroppableCjsExportAssignment { name, path });
             }
         }
 
-        /// Returns the removable writes and whether the `__esModule` flag is set.
-        pub(super) fn droppable_cjs_exports(
+        /// Returns the removable writes and whether the `__esModule` flag is set, plus
+        /// the static-exports for scope hoisting.
+        pub(super) fn cjs_exports_analysis(
             &mut self,
-        ) -> Option<(Vec<DroppableCjsExportAssignment>, bool)> {
-            let c = self.state.cjs_exports.take()?;
-            if c.writes.is_empty() {
-                return None;
-            }
-            Some((c.writes, c.has_es_module))
+        ) -> (
+            Option<(Vec<DroppableCjsExportAssignment>, bool)>,
+            Option<CjsStaticExports>,
+        ) {
+            let Some(c) = self.state.cjs_exports.take() else {
+                return (None, None);
+            };
+            // A top-level `return` skips the writes after it, and would abandon the rest
+            // of a merged factory.
+            let static_exports = (!c.has_top_level_return).then(|| CjsStaticExports {
+                export_names: c.writes.iter().map(|w| w.name.clone()).collect(),
+                has_es_module: c.has_es_module,
+            });
+            // Dropping an unused write stays sound regardless of the `return`, but
+            // `__esModule` may be set after it, so it can't be claimed.
+            let has_es_module = c.has_es_module && !c.has_top_level_return;
+            let drops = (!c.writes.is_empty()).then_some((c.writes, has_es_module));
+            (drops, static_exports)
         }
 
         /// Whether `target` is a static named CommonJS export write —
@@ -2123,6 +2147,8 @@ impl VisitAstPath for Analyzer<'_, '_> {
                 .unwrap_or(JsValue::Constant(ConstantValue::Undefined));
 
             self.add_return_value(return_value);
+        } else {
+            self.set_cjs_has_top_level_return();
         }
 
         self.add_early_return_always(ast_path);
@@ -2293,11 +2319,14 @@ impl VisitAstPath for Analyzer<'_, '_> {
             .extend(self.arena, take(&mut self.hoisted_effects));
         self.data.effects = take(&mut self.effects).into_iter().collect();
 
-        // Emit the CommonJS unused-export drop code-gen, if any.
-        if let Some((drops, has_es_module)) = self.droppable_cjs_exports() {
+        // Emit the CommonJS unused-export drop code-gen, if any, and surface the
+        // static-exports for scope hoisting.
+        let (drops, cjs_static_exports) = self.cjs_exports_analysis();
+        if let Some((drops, has_es_module)) = drops {
             self.code_gens
                 .push(CjsExportsDropCodeGen::new(drops, has_es_module).into());
         }
+        self.data.cjs_static_exports = cjs_static_exports;
 
         self.data.code_gens = take(&mut self.code_gens);
     }
