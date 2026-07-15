@@ -177,6 +177,14 @@ pub trait MergeableModule: Module {
         Vc::cell(true)
     }
 
+    /// Whether the module is ESM or CommonJS. Modules of any kind can be merged into
+    /// one group; this drives interop when they're mixed (e.g. a CommonJS module
+    /// imported by an ESM module must expose its exports namespace).
+    #[turbo_tasks::function]
+    fn merge_kind(self: Vc<Self>) -> Vc<MergeableModuleKind> {
+        MergeableModuleKind::EcmaScript.cell()
+    }
+
     /// Create a new module representing the merged content of the given `modules`.
     ///
     /// Group entry points are not referenced by any other module in the group. This list is needed
@@ -198,6 +206,13 @@ impl MergeableModules {
     pub fn interned(modules: Vec<ResolvedVc<Box<dyn MergeableModule>>>) -> Vc<Self> {
         Vc::cell(modules)
     }
+}
+
+#[derive(Copy, Clone, Debug, Hash)]
+#[turbo_tasks::value(shared)]
+pub enum MergeableModuleKind {
+    EcmaScript,
+    CommonJs,
 }
 
 /// Whether a given module needs to be exposed (depending on how it is imported by other modules)

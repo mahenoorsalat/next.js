@@ -88,8 +88,8 @@ use turbo_tasks_fs::{FileJsonContent, FileSystemPath, glob::Glob, rope::Rope};
 use turbopack_core::{
     chunk::{
         AsyncModuleInfo, ChunkItem, ChunkableModule, ChunkingContext, EvaluatableAsset,
-        MergeableModule, MergeableModuleExposure, MergeableModules, MergeableModulesExposed,
-        MinifyType, ModuleChunkItemIdExt, ModuleId,
+        MergeableModule, MergeableModuleExposure, MergeableModuleKind, MergeableModules,
+        MergeableModulesExposed, MinifyType, ModuleChunkItemIdExt, ModuleId,
     },
     compile_time_info::CompileTimeInfo,
     context::AssetContext,
@@ -919,6 +919,19 @@ impl MergeableModule for EcmascriptModuleAsset {
         }
 
         Ok(Vc::cell(false))
+    }
+
+    #[turbo_tasks::function]
+    async fn merge_kind(self: ResolvedVc<Self>) -> Result<Vc<MergeableModuleKind>> {
+        Ok(if matches!(
+            &*self.get_exports().await?,
+            EcmascriptExports::CommonJs(Some(_))
+        ) {
+            MergeableModuleKind::CommonJs
+        } else {
+            MergeableModuleKind::EcmaScript
+        }
+        .cell())
     }
 
     #[turbo_tasks::function]

@@ -7,8 +7,8 @@ use turbo_tasks::{FxIndexMap, FxIndexSet, ResolvedVc, TryFlatJoinIterExt, TryJoi
 
 use crate::{
     chunk::{
-        ChunkableModule, ChunkingType, MergeableModule, MergeableModuleExposure, MergeableModules,
-        MergeableModulesExposed,
+        ChunkableModule, ChunkingType, MergeableModule, MergeableModuleExposure,
+        MergeableModuleKind, MergeableModules, MergeableModulesExposed,
     },
     module::Module,
     module_graph::{
@@ -131,22 +131,27 @@ pub async fn compute_merged_modules(module_graph: Vc<ModuleGraph>) -> Result<Vc<
             FxHashSet::with_capacity_and_hasher(module_count, Default::default());
 
         let inner_span = tracing::info_span!("collect mergeable modules");
-        let mergeable = module_graph
+        let mergeable_modules = module_graph
             .iter_reachable_modules()?
             .map(async |module| {
                 if let Some(mergeable) =
                     ResolvedVc::try_downcast::<Box<dyn MergeableModule>>(module)
                     && *mergeable.is_mergeable().await?
                 {
-                    return Ok(Some(module));
+                    return Ok(Some((module, *mergeable.merge_kind().await?)));
                 }
                 Ok(None)
             })
             .try_flat_join()
             .instrument(inner_span)
-            .await?
+            .await?;
+
+        let merge_kinds: FxHashMap<_, _> = mergeable_modules.iter().copied().collect();
+
+        let mergeable: FxHashSet<_> = mergeable_modules
             .into_iter()
-            .collect::<FxHashSet<_>>();
+            .map(|(module, _)| module)
+            .collect();
 
         // Pre-fetch async status for all mergeable modules using keyed access to avoid
         // reading the full AsyncModulesInfo set during the synchronous traversal below.
@@ -530,14 +535,20 @@ pub async fn compute_merged_modules(module_graph: Vc<ModuleGraph>) -> Result<Vc<
                     // necessarily needed for browser),
                     exposed_modules_imported.insert(module);
                 }
-                if parent_info.is_some_and(|(_, r)| {
+                if parent_info.is_some_and(|(parent, r)| {
                     matches!(
                         r.binding_usage.export,
                         ExportUsage::All | ExportUsage::PartialNamespaceObject(_)
                     )
+                    // An ESM `import` of a CommonJS module reads it through the interop
+                    // namespace, so it must materialize its exports (unless side-effect-only).
+                    || (!matches!(r.binding_usage.export, ExportUsage::Evaluation)
+                        && merge_kinds.get(&parent) == Some(&MergeableModuleKind::EcmaScript)
+                        && merge_kinds.get(&module) == Some(&MergeableModuleKind::CommonJs))
                 }) {
                     // This module needs to be exposed:
-                    // - namespace import from another group
+                    // - namespace import from another group, or
+                    // - CommonJS target of an ESM import (needs interop namespace)
                     exposed_modules_namespace.insert(module);
                 }
                 Ok(())

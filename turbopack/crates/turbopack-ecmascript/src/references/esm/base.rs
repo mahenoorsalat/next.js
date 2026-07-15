@@ -215,6 +215,23 @@ impl ReferencedAsset {
     ) -> Result<Option<ReferencedAssetIdent>> {
         Ok(match self {
             ReferencedAsset::Some(asset) => {
+                // An in-group static CommonJS target: bind a named import directly to the CJS
+                // per-export local (registered in `export_contexts` under `ctxt`), the same
+                // way a CJS→CJS require resolves. `default`/namespace and unknown names fall
+                // through to the `.i(id)` interop path below.
+                if let Some(ctxt) = scope_hoisting_context.get_module_syntax_context(*asset)
+                    && let Some(export) = &export
+                    && let EcmascriptExports::CommonJs(Some(static_exports)) =
+                        &*asset.get_exports().await?
+                    && static_exports.export_names.contains(export)
+                {
+                    return Ok(Some(ReferencedAssetIdent::LocalBinding {
+                        ident: export.clone(),
+                        ctxt,
+                        liveness: Liveness::Live,
+                    }));
+                }
+
                 if let Some(ctxt) = scope_hoisting_context.get_module_syntax_context(*asset)
                     && let Some(export) = &export
                     && let EcmascriptExports::EsmExports(exports) = *asset.get_exports().await?
