@@ -33,8 +33,9 @@ import {
 } from '../../shared/lib/utils/reflect-utils'
 import {
   makeDevtoolsIOAwarePromise,
-  makeHangingPromise,
+  makeFallbackParamsHangingPromise,
   makePromiseFromTrigger,
+  trackFallbackParamsAccessed,
   RENDER_STAGES_BY_DATA_KIND,
 } from '../dynamic-rendering-utils'
 import { createDedupedByCallsiteServerErrorLoggerDev } from '../create-deduped-by-callsite-server-error-logger'
@@ -287,10 +288,11 @@ export function createPrerenderParamsForClientSegment(
               // to consider the awaiting of this params object "dynamic". Since
               // we are in cacheComponents mode we encode this as a promise that never
               // resolves.
-              return makeHangingPromise(
+              return makeFallbackParamsHangingPromise(
                 workUnitStore.renderSignal,
                 workStore.route,
-                '`params`'
+                '`params`',
+                workUnitStore
               )
             }
           }
@@ -718,16 +720,23 @@ function makeHangingParams(
   workStore: WorkStore,
   prerenderStore: StaticPrerenderStoreModern | PrerenderStoreModernRuntime
 ): Promise<Params> {
+  // The cache below is keyed by the params object, not the prerender store,
+  // so a cache hit may come from a promise created under a different store.
+  // Record the access on this store explicitly rather than relying on the
+  // tracking inside makeFallbackParamsHangingPromise.
+  trackFallbackParamsAccessed(prerenderStore)
+
   const cachedParams = CachedParams.get(underlyingParams)
   if (cachedParams) {
     return cachedParams
   }
 
   const promise = new Proxy(
-    makeHangingPromise<Params>(
+    makeFallbackParamsHangingPromise<Params>(
       prerenderStore.renderSignal,
       workStore.route,
-      '`params`'
+      '`params`',
+      prerenderStore
     ),
     fallbackParamsProxyHandler
   )
