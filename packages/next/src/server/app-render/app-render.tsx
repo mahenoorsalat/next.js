@@ -23,6 +23,7 @@ import type {
   InstantValidationSamples,
   PrerenderStoreModernClient,
   PrerenderStoreModernRuntime,
+  PrerenderStoreModernServer,
   RequestStore,
   ValidationStoreClient,
   WorkUnitStore,
@@ -8108,6 +8109,9 @@ async function prerenderToStream(
         hmrRefreshHash: undefined,
         // We don't track vary params during initial prerender, only the final one
         varyParamsAccumulator: null,
+        runtimeDataAccessed: null,
+        shouldAttemptStaticPrefetch: null,
+        isFallbackUpgradeable: renderOpts.isFallbackUpgradeable === true,
       }
 
       // We're not going to use the result of this render because the only time it could be used
@@ -8142,6 +8146,9 @@ async function prerenderToStream(
         hmrRefreshHash: undefined,
         // We don't track vary params during initial prerender, only the final one
         varyParamsAccumulator: null,
+        runtimeDataAccessed: null,
+        shouldAttemptStaticPrefetch: null,
+        isFallbackUpgradeable: renderOpts.isFallbackUpgradeable === true,
       })
 
       const initialPrerenderOptions = {
@@ -8366,7 +8373,26 @@ async function prerenderToStream(
         finalStage: RenderStage.Static,
       })
 
-      const finalServerPayloadPrerenderStore: PrerenderStore = {
+      // Records runtime data accesses from the payload and render stores
+      // below into the RSC payload (as `u`), resolved `true` at the moment
+      // of first access so the fulfillment row is serialized at the stream
+      // position where it happened. Used when generating per-segment
+      // prefetch responses. Request data props (params, searchParams) are
+      // created while the RSC payload is constructed, under the payload
+      // store; both stores share the same promise so it observes accesses
+      // from both.
+      const runtimeDataAccessed = createPromiseWithResolvers<boolean>()
+
+      // Companion cell holding the build-constant static-prefetch hint
+      // value directly: starts true, and a disqualifying runtime-data
+      // access flips it false — fallback-param accesses on an upgradeable
+      // route don't (see trackRuntimeDataAccessed, which applies the rule
+      // at access time). Read after the prerender settles by
+      // collectSegmentData below. Shared between both stores for the same
+      // reason as the promise.
+      const shouldAttemptStaticPrefetch = { current: true }
+
+      const finalServerPayloadPrerenderStore: PrerenderStoreModernServer = {
         type: 'prerender',
         phase: 'render',
         rootParams,
@@ -8392,6 +8418,9 @@ async function prerenderToStream(
         resumeDataCache,
         hmrRefreshHash: undefined,
         varyParamsAccumulator,
+        runtimeDataAccessed,
+        shouldAttemptStaticPrefetch,
+        isFallbackUpgradeable: renderOpts.isFallbackUpgradeable === true,
       }
 
       const shellByteLengthDeferred = createPromiseWithResolvers<
@@ -8413,6 +8442,13 @@ async function prerenderToStream(
       if (cachedNavigations) {
         staleTimeIterable = new StaleTimeIterable()
         finalServerPayload.s = staleTimeIterable
+      }
+
+      if (shouldGenerateStaticFlightData(workStore)) {
+        // Embed the runtime data access tracking in the payload so
+        // collectSegmentData can replay it per stage. Only needed when the
+        // Flight data will be decomposed into segment prefetches below.
+        finalServerPayload.u = runtimeDataAccessed.promise
       }
 
       const serverDynamicTracking = createDynamicTrackingState(
@@ -8439,6 +8475,9 @@ async function prerenderToStream(
         resumeDataCache,
         hmrRefreshHash: undefined,
         varyParamsAccumulator,
+        runtimeDataAccessed,
+        shouldAttemptStaticPrefetch,
+        isFallbackUpgradeable: renderOpts.isFallbackUpgradeable === true,
       })
 
       if (staleTimeIterable !== undefined) {
@@ -8489,11 +8528,12 @@ async function prerenderToStream(
 
         // FIXME(NAR-810): If we're already aborted due to Sync IO, there should be no need to
         // finish the accumulators. However, it seems like in `--debug-prerender`
-        // the stream will stay open if we don't close the iterables here.
+        // the stream will stay open if we don't settle these here.
         if (process.env.NODE_ENV === 'development') {
           if (staleTimeIterable !== undefined) {
             staleTimeIterable.close()
           }
+          runtimeDataAccessed.resolve(false)
           finishAccumulatingVaryParams(varyParamsAccumulator)
         }
       }
@@ -8581,6 +8621,9 @@ async function prerenderToStream(
           if (staleTimeIterable !== undefined) {
             staleTimeIterable.close()
           }
+          // Idempotent: a no-op if a runtime data access already resolved it
+          // `true`. The `false` row lands here, after all stage content.
+          runtimeDataAccessed.resolve(false)
           finishAccumulatingVaryParams(varyParamsAccumulator)
 
           shellByteLengthDeferred.resolve(
@@ -9376,6 +9419,9 @@ async function prerenderToStream(
         resumeDataCache: originalResumeDataCache,
         hmrRefreshHash: undefined,
         varyParamsAccumulator: null,
+        runtimeDataAccessed: null,
+        shouldAttemptStaticPrefetch: null,
+        isFallbackUpgradeable: renderOpts.isFallbackUpgradeable === true,
       }
 
       const errorRSCPayload = await workUnitAsyncStorage.run(
@@ -10015,33 +10061,60 @@ async function collectSegmentData(
 
   // Resolve prefetch hints. At runtime (next start / ISR), the precomputed
   // hints are already loaded from the prefetch-hints.json manifest. During
-  // build, compute them by measuring segment gzip sizes and write them to
-  // metadata so the build pipeline can persist them to the manifest.
+  // build, compute them and write them to metadata so the build pipeline
+  // can persist them to the manifest. Like every other hint bit, the
+  // static-prefetch-attempt hint is computed once here and stays constant
+  // for the entire build — it must reach every response that carries
+  // prefetch hints (dynamic navigations included), which only the manifest
+  // flow can guarantee.
   let hints: PrefetchHints | null
   const prefetchInlining = renderOpts.experimental.prefetchInlining
-  if (!prefetchInlining) {
-    hints = null
-  } else if (renderOpts.isBuildTimePrerendering) {
-    // Build time: compute fresh hints and store in metadata for the manifest.
-    hints = await ComponentMod.collectPrefetchHints(
-      fullPageDataBuffer,
-      staleTime,
-      clientModules,
-      serverConsumerManifest,
-      prefetchInlining.maxSize,
-      prefetchInlining.maxBundleSize
-    )
-    metadata.prefetchHints = hints
+  if (renderOpts.isBuildTimePrerendering) {
+    // Whether the client should attempt a static prefetch for this route
+    // (PrefetchHint.ShouldAttemptStaticPrefetch): the prerender store's
+    // cell holds the hint value directly — true iff the build-time
+    // prerender accessed no runtime data that disqualifies a static
+    // attempt. The fallback-param upgradeability rule is applied at access
+    // time — see trackRuntimeDataAccessed — so only the settled value is
+    // read here. Only the modern (cacheComponents) prerender tracks
+    // accesses; legacy prerenders conservatively never set the hint.
+    const hintCell =
+      prerenderStore.type === 'prerender'
+        ? prerenderStore.shouldAttemptStaticPrefetch
+        : null
+    const shouldAttemptStaticPrefetch = hintCell !== null && hintCell.current
+    if (prefetchInlining || shouldAttemptStaticPrefetch) {
+      // Build time: compute fresh hints and store in metadata for the
+      // manifest. When prefetch inlining is disabled there are no sizes to
+      // measure, but the static-prefetch hint still rides the manifest —
+      // collectPrefetchHints then only builds the tree shape carrying it.
+      hints = await ComponentMod.collectPrefetchHints(
+        fullPageDataBuffer,
+        staleTime,
+        clientModules,
+        serverConsumerManifest,
+        prefetchInlining,
+        shouldAttemptStaticPrefetch
+      )
+      metadata.prefetchHints = hints
+    } else {
+      // Inlining is disabled and the hint didn't qualify — there's nothing
+      // to record, so don't write a manifest entry for this route.
+      hints = null
+    }
   } else {
     // Runtime: use hints from the manifest. Never compute fresh hints
     // during ISR/revalidation.
     const manifestHints = renderOpts.prefetchHints?.[pagePath]
     if (manifestHints === undefined) {
-      if (!renderOpts.cacheComponents) {
+      if (!prefetchInlining || !renderOpts.cacheComponents) {
         // Without cacheComponents, dynamic pages have no static shell
-        // and therefore no prerender pass to compute hints. This is
-        // expected — just skip the hint system for this route and let
-        // prefetching proceed normally without inlining decisions.
+        // and therefore no prerender pass to compute hints; and with
+        // inlining disabled, a missing entry just means the route didn't
+        // qualify for the static-prefetch hint at build. Either way this
+        // is expected — skip the hint system for this route and let
+        // prefetching proceed normally without inlining decisions (the
+        // client goes straight to runtime prefetches where it matters).
         hints = null
       } else {
         // TODO(#91407): No hints found for this route. This currently
@@ -10050,9 +10123,12 @@ async function collectSegmentData(
         // manifest to be unavailable at runtime.
         //
         // Fall back to a hint tree that marks everything as
-        // unprefetchable. Once the instant:false bug is fixed, this
-        // should become an error — the manifest should always have an
-        // entry for every route that reaches collectSegmentData.
+        // unprefetchable. This also swallows the static-prefetch-attempt
+        // hint — such routes never carry it, so the client goes straight
+        // to a runtime prefetch, which is safe (just less cacheable).
+        // Once the instant:false bug is fixed, this should become an
+        // error — the manifest should always have an entry for every
+        // route that reaches collectSegmentData.
         hints = {
           hints: PrefetchHint.PrefetchDisabled,
           slots: null,
