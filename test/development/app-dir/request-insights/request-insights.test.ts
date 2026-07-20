@@ -182,6 +182,28 @@ describe('request insights', () => {
           rootSpans?.some((rootSpan) => rootSpan.spanId === span.parentSpanId)
         ).toBe(true)
       }
+
+      const runValidationSpans = pipelineSpans?.filter(
+        (span) =>
+          span.attributes?.['next.span_type'] ===
+          'AppRender.instantInsights.runValidation'
+      )
+      const renderAttemptSpans = instantInsights?.spans.filter(
+        (span) =>
+          span.attributes?.['next.span_type'] ===
+          'AppRender.instantInsights.renderAttempt'
+      )
+      expect(renderAttemptSpans?.length).toBeGreaterThan(1)
+      for (const span of renderAttemptSpans ?? []) {
+        expect(span.name).toMatch(/^Render \//)
+        expect(span.attributes?.['next.segment']).not.toBe('')
+        expect(
+          runValidationSpans?.some(
+            (runValidationSpan) =>
+              runValidationSpan.spanId === span.parentSpanId
+          )
+        ).toBe(true)
+      }
       expect(
         request?.spans.some(
           (span) =>
@@ -189,7 +211,9 @@ describe('request insights', () => {
               'AppRender.instantInsights' ||
             pipelineSpanTypes.includes(
               span.attributes?.['next.span_type'] as string
-            )
+            ) ||
+            span.attributes?.['next.span_type'] ===
+              'AppRender.instantInsights.renderAttempt'
         )
       ).toBe(false)
     })

@@ -4571,7 +4571,7 @@ function runDevValidationInBackground(
             spanName: 'Run validation',
             parentSpan: instantInsightsSpan,
           },
-          () =>
+          (runValidationSpan) =>
             runValidationInDev(
               prefetchMode,
               instantInputs,
@@ -4579,7 +4579,8 @@ function runDevValidationInBackground(
               ctx,
               fallbackRouteParams,
               devRenderDidError,
-              validationAbortSignal
+              validationAbortSignal,
+              runValidationSpan
             )
         )
       })
@@ -6138,7 +6139,8 @@ async function runValidationInDevImpl(
   ctx: AppRenderContext,
   fallbackRouteParams: OpaqueFallbackRouteParams | null,
   devRenderDidError: boolean,
-  validationAbortSignal: AbortSignal
+  validationAbortSignal: AbortSignal,
+  runValidationSpan: Span | undefined
 ): Promise<void> {
   const { componentMod: ComponentMod, getDynamicParamFromSegment } = ctx
   const loaderTree = ComponentMod.routeModule.userland.loaderTree
@@ -6266,7 +6268,8 @@ async function runValidationInDevImpl(
       hmrRefreshHash,
       validationSamples,
       devRenderDidError,
-      validationAbortSignal
+      validationAbortSignal,
+      runValidationSpan
     )
 
     // A newer render superseded this work. Don't surface stale validation
@@ -6728,7 +6731,8 @@ async function validateInstantConfigs(
   hmrRefreshHash: string | undefined,
   validationSamples: ValidationStoreClient['validationSamples'] | null,
   devRenderDidError: boolean,
-  validationAbortSignal?: AbortSignal
+  validationAbortSignal?: AbortSignal,
+  renderAttemptParentSpan?: Span
 ): Promise<Array<unknown>> {
   const debug =
     process.env.NEXT_PRIVATE_DEBUG_VALIDATION === '1' ? console.log : undefined
@@ -6838,188 +6842,216 @@ async function validateInstantConfigs(
       return null
     }
 
-    const reactController = new AbortController()
-    const renderController = new AbortController()
-    const reactSignal =
-      validationAbortSignal === undefined
-        ? reactController.signal
-        : AbortSignal.any([reactController.signal, validationAbortSignal])
-    const preinitScripts = () => {}
-    const { ServerInsertedHTMLProvider } = createServerInsertedHTML()
-
-    const { stream: serverStream, debugStream } =
-      await createCombinedPayloadStream(
-        ctx.componentMod,
-        renderFlightStream,
-        payloadResult.payload,
-        extraChunksController,
-        reactSignal,
-        clientReferenceManifest,
-        startTime,
-        isDebugChannelEnabled,
-        createDebugChannel
-      )
-
-    const instantValidationState = createInstantValidationState(
-      payloadResult.slotStacks
+    const segmentPaths = Array.from(
+      boundaryState.requiredIds.keys(),
+      (segmentPath) => segmentPath || '/'
     )
+    const segmentLabel = segmentPaths.length > 0 ? segmentPaths.join(', ') : '/'
+    const renderAttemptName = `Render ${segmentLabel}${
+      previousBoundaryState === null ? '' : ' (runtime retry)'
+    }`
 
-    const validationSampleTracking =
-      validationSamples !== null ? createValidationSampleTracking() : null
+    const result = await getTracer().trace(
+      AppRenderSpan.instantInsightsRenderAttempt,
+      {
+        spanName: renderAttemptName,
+        parentSpan: renderAttemptParentSpan,
+        attributes: {
+          'next.segment': segmentLabel,
+        },
+      },
+      async () => {
+        const reactController = new AbortController()
+        const renderController = new AbortController()
+        const reactSignal =
+          validationAbortSignal === undefined
+            ? reactController.signal
+            : AbortSignal.any([reactController.signal, validationAbortSignal])
+        const preinitScripts = () => {}
+        const { ServerInsertedHTMLProvider } = createServerInsertedHTML()
 
-    const clientDynamicTracking = createDynamicTrackingState(false)
+        const { stream: serverStream, debugStream } =
+          await createCombinedPayloadStream(
+            ctx.componentMod,
+            renderFlightStream,
+            payloadResult.payload,
+            extraChunksController,
+            reactSignal,
+            clientReferenceManifest,
+            startTime,
+            isDebugChannelEnabled,
+            createDebugChannel
+          )
 
-    const prerenderStore: PrerenderStore = {
-      type: 'validation-client',
-      phase: 'render',
-      rootParams,
-      implicitTags,
-      renderSignal: renderController.signal,
-      controller: reactController,
-      cacheSignal: null,
-      dynamicTracking: clientDynamicTracking,
-      revalidate: INFINITE_CACHE,
-      expire: INFINITE_CACHE,
-      stale: INFINITE_CACHE,
-      tags: [...implicitTags.tags],
-      resumeDataCache: null,
-      hmrRefreshHash,
-      varyParamsAccumulator: null,
-      boundaryState,
-      fallbackRouteParams,
-      validationSamples,
-      validationSampleTracking,
-    }
+        const instantValidationState = createInstantValidationState(
+          payloadResult.slotStacks
+        )
 
-    let dynamicHoleKind: DynamicHoleKind
-    switch (prefetchKind) {
-      case ValidationPrefetchKind.Shell: {
-        dynamicHoleKind = payloadResult.hasAmbiguousErrors
-          ? DynamicHoleKind.Link
-          : DynamicHoleKind.Dynamic
-        break
-      }
-      case ValidationPrefetchKind.LegacySpeculative: {
-        dynamicHoleKind = payloadResult.hasAmbiguousErrors
-          ? DynamicHoleKind.Runtime
-          : DynamicHoleKind.Dynamic
-        break
-      }
-    }
+        const validationSampleTracking =
+          validationSamples !== null ? createValidationSampleTracking() : null
 
-    let result: NavigationValidationResult
-    try {
-      const { prelude: unprocessedPrelude } = await runInSequentialTasks(
-        () => {
-          const pendingResult = workUnitAsyncStorage.run(
-            prerenderStore,
-            getClientPrerender,
-            // eslint-disable-next-line @next/internal/no-ambiguous-jsx -- React Client
-            <App
-              reactServerStream={serverStream}
-              reactDebugStream={debugStream ?? undefined}
-              debugEndTime={undefined}
-              preinitScripts={preinitScripts}
-              ServerInsertedHTMLProvider={ServerInsertedHTMLProvider}
-              nonce={nonce}
-              images={ctx.renderOpts.images}
-            />,
-            {
-              signal: reactSignal,
-              onError: (err: unknown, errorInfo: ErrorInfo) => {
-                if (isPrerenderInterruptedError(err) || reactSignal.aborted) {
-                  const componentStack = errorInfo.componentStack
-                  if (typeof componentStack === 'string') {
-                    trackDynamicHoleInNavigation(
-                      err,
-                      workStore,
-                      componentStack,
-                      instantValidationState,
-                      clientDynamicTracking,
-                      dynamicHoleKind,
-                      boundaryState
-                    )
-                  }
-                  return
-                } else if (!reactSignal.aborted) {
-                  const componentStack = errorInfo.componentStack
-                  if (typeof componentStack === 'string') {
-                    let errorForDisplay = err
-                    if (process.env.NODE_ENV === 'production') {
-                      // In production (i.e. build validation), Flight omits everything except the digest
-                      // when serializing errors, which makes them very unfriendly for debugging.
-                      // Map the deserialized errors back to their original error object to make it more useful.
-                      if (
-                        err &&
-                        typeof err === 'object' &&
-                        'digest' in err &&
-                        typeof err.digest === 'string'
-                      ) {
-                        const serverError =
-                          workStore.reactServerErrorsByDigest.get(err.digest)
-                        if (serverError !== undefined) {
-                          errorForDisplay = serverError
+        const clientDynamicTracking = createDynamicTrackingState(false)
+
+        const prerenderStore: PrerenderStore = {
+          type: 'validation-client',
+          phase: 'render',
+          rootParams,
+          implicitTags,
+          renderSignal: renderController.signal,
+          controller: reactController,
+          cacheSignal: null,
+          dynamicTracking: clientDynamicTracking,
+          revalidate: INFINITE_CACHE,
+          expire: INFINITE_CACHE,
+          stale: INFINITE_CACHE,
+          tags: [...implicitTags.tags],
+          resumeDataCache: null,
+          hmrRefreshHash,
+          varyParamsAccumulator: null,
+          boundaryState,
+          fallbackRouteParams,
+          validationSamples,
+          validationSampleTracking,
+        }
+
+        let dynamicHoleKind: DynamicHoleKind
+        switch (prefetchKind) {
+          case ValidationPrefetchKind.Shell: {
+            dynamicHoleKind = payloadResult.hasAmbiguousErrors
+              ? DynamicHoleKind.Link
+              : DynamicHoleKind.Dynamic
+            break
+          }
+          case ValidationPrefetchKind.LegacySpeculative: {
+            dynamicHoleKind = payloadResult.hasAmbiguousErrors
+              ? DynamicHoleKind.Runtime
+              : DynamicHoleKind.Dynamic
+            break
+          }
+        }
+
+        let validationResult: NavigationValidationResult
+        try {
+          const { prelude: unprocessedPrelude } = await runInSequentialTasks(
+            () => {
+              const pendingResult = workUnitAsyncStorage.run(
+                prerenderStore,
+                getClientPrerender,
+                // eslint-disable-next-line @next/internal/no-ambiguous-jsx -- React Client
+                <App
+                  reactServerStream={serverStream}
+                  reactDebugStream={debugStream ?? undefined}
+                  debugEndTime={undefined}
+                  preinitScripts={preinitScripts}
+                  ServerInsertedHTMLProvider={ServerInsertedHTMLProvider}
+                  nonce={nonce}
+                  images={ctx.renderOpts.images}
+                />,
+                {
+                  signal: reactSignal,
+                  onError: (err: unknown, errorInfo: ErrorInfo) => {
+                    if (
+                      isPrerenderInterruptedError(err) ||
+                      reactSignal.aborted
+                    ) {
+                      const componentStack = errorInfo.componentStack
+                      if (typeof componentStack === 'string') {
+                        trackDynamicHoleInNavigation(
+                          err,
+                          workStore,
+                          componentStack,
+                          instantValidationState,
+                          clientDynamicTracking,
+                          dynamicHoleKind,
+                          boundaryState
+                        )
+                      }
+                      return
+                    } else if (!reactSignal.aborted) {
+                      const componentStack = errorInfo.componentStack
+                      if (typeof componentStack === 'string') {
+                        let errorForDisplay = err
+                        if (process.env.NODE_ENV === 'production') {
+                          // In production (i.e. build validation), Flight omits everything except the digest
+                          // when serializing errors, which makes them very unfriendly for debugging.
+                          // Map the deserialized errors back to their original error object to make it more useful.
+                          if (
+                            err &&
+                            typeof err === 'object' &&
+                            'digest' in err &&
+                            typeof err.digest === 'string'
+                          ) {
+                            const serverError =
+                              workStore.reactServerErrorsByDigest.get(
+                                err.digest
+                              )
+                            if (serverError !== undefined) {
+                              errorForDisplay = serverError
+                            }
+                          }
                         }
+
+                        trackThrownErrorInNavigation(
+                          workStore,
+                          instantValidationState,
+                          errorForDisplay,
+                          componentStack
+                        )
                       }
                     }
 
-                    trackThrownErrorInNavigation(
-                      workStore,
-                      instantValidationState,
-                      errorForDisplay,
-                      componentStack
-                    )
-                  }
-                }
+                    if (isReactLargeShellError(err)) {
+                      console.error(err)
+                      return undefined
+                    }
 
-                if (isReactLargeShellError(err)) {
-                  console.error(err)
-                  return undefined
+                    return getDigestForWellKnownError(err)
+                  },
                 }
+              )
 
-                return getDigestForWellKnownError(err)
-              },
+              reactSignal.addEventListener(
+                'abort',
+                () => {
+                  renderController.abort()
+                },
+                { once: true }
+              )
+
+              return pendingResult
+            },
+            () => {
+              workUnitAsyncStorage.run(
+                prerenderStore,
+                reactController.abort.bind(reactController)
+              )
             }
           )
 
-          reactSignal.addEventListener(
-            'abort',
-            () => {
-              renderController.abort()
-            },
-            { once: true }
-          )
+          const { preludeIsEmpty } = await processPreludeOp(unprocessedPrelude)
 
-          return pendingResult
-        },
-        () => {
-          workUnitAsyncStorage.run(
-            prerenderStore,
-            reactController.abort.bind(reactController)
+          validationResult = getNavigationDisallowedDynamicReasons(
+            workStore,
+            preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
+            instantValidationState,
+            validationSampleTracking,
+            boundaryState,
+            devRenderDidError
+          )
+        } catch (thrownValue) {
+          validationResult = getNavigationDisallowedDynamicReasons(
+            workStore,
+            PreludeState.Errored,
+            instantValidationState,
+            validationSampleTracking,
+            boundaryState,
+            devRenderDidError
           )
         }
-      )
 
-      const { preludeIsEmpty } = await processPreludeOp(unprocessedPrelude)
-
-      result = getNavigationDisallowedDynamicReasons(
-        workStore,
-        preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
-        instantValidationState,
-        validationSampleTracking,
-        boundaryState,
-        devRenderDidError
-      )
-    } catch (thrownValue) {
-      result = getNavigationDisallowedDynamicReasons(
-        workStore,
-        PreludeState.Errored,
-        instantValidationState,
-        validationSampleTracking,
-        boundaryState,
-        devRenderDidError
-      )
-    }
+        return validationResult
+      }
+    )
 
     // If the prerender produced no real errors at this depth — either an
     // empty array (clean) or a deferred-only result (Error/AggregateError

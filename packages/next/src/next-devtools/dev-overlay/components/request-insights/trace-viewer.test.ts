@@ -120,6 +120,28 @@ describe('request insights trace viewer', () => {
             'next.span_type': 'AppRender.instantInsights.runValidation',
           },
         },
+        {
+          name: 'Render /dashboard',
+          spanId: 'render-dashboard',
+          parentSpanId: 'validate',
+          startTime: 127,
+          durationMs: 8,
+          attributes: {
+            'next.segment': '/dashboard',
+            'next.span_type': 'AppRender.instantInsights.renderAttempt',
+          },
+        },
+        {
+          name: 'Render /dashboard (runtime retry)',
+          spanId: 'render-dashboard-retry',
+          parentSpanId: 'validate',
+          startTime: 136,
+          durationMs: 6,
+          attributes: {
+            'next.segment': '/dashboard',
+            'next.span_type': 'AppRender.instantInsights.renderAttempt',
+          },
+        },
       ],
     })
 
@@ -133,6 +155,8 @@ describe('request insights trace viewer', () => {
       { label: 'Wait for cache readiness', depth: 1 },
       { label: 'Prepare validation inputs', depth: 1 },
       { label: 'Run validation', depth: 1 },
+      { label: 'Render /dashboard', depth: 2 },
+      { label: 'Render /dashboard (runtime retry)', depth: 2 },
     ])
   })
 

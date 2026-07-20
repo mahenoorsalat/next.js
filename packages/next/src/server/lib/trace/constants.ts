@@ -93,6 +93,7 @@ enum AppRenderSpan {
   instantInsightsWaitForCache = 'AppRender.instantInsights.waitForCache',
   instantInsightsPrepareValidation = 'AppRender.instantInsights.prepareValidation',
   instantInsightsRunValidation = 'AppRender.instantInsights.runValidation',
+  instantInsightsRenderAttempt = 'AppRender.instantInsights.renderAttempt',
 }
 
 enum RouterSpan {
