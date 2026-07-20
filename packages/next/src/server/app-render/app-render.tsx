@@ -100,11 +100,8 @@ import {
   getRequestInsightsIdentity,
   runWithRequestInsightsIdentity,
 } from '../lib/trace/request-insights-identity'
-import { getTracer, SpanStatusCode } from '../lib/trace/tracer'
-import {
-  createLocalSpan,
-  withLocalSpan,
-} from '../lib/trace/local-span-recorder'
+import { getTracer, SpanStatusCode, type Span } from '../lib/trace/tracer'
+import { createLocalSpan } from '../lib/trace/local-span-recorder'
 import { isRequestInsightsEnabled } from '../lib/trace/request-insights'
 import { FlightRenderResult } from './flight-render-result'
 import {
@@ -4482,7 +4479,7 @@ function runDevValidationInBackground(
         return
       }
 
-      return runInstantInsightsWithTracing(ctx, async () => {
+      return runInstantInsightsWithTracing(ctx, async (instantInsightsSpan) => {
         // Read whether the streamed render errored only now that it has fully
         // settled.
         const devRenderDidError = getDevRenderDidError()
@@ -4492,7 +4489,14 @@ function runDevValidationInBackground(
         // that (a no-op when the render didn't miss) before planning, which reads
         // the work store.
         if (result.hadCacheMiss) {
-          await cacheSignal.cacheReady()
+          await getTracer().trace(
+            AppRenderSpan.instantInsightsWaitForCache,
+            {
+              spanName: 'Wait for cache readiness',
+              parentSpan: instantInsightsSpan,
+            },
+            () => cacheSignal.cacheReady()
+          )
         }
 
         if (validationAbortSignal.aborted) {
@@ -4511,32 +4515,42 @@ function runDevValidationInBackground(
           return
         }
 
-        const lazyInputs = await prepareValidationInputs(
-          prefetchMode,
-          navigationKind,
-          result,
-          requestStore,
-          validationDebugChannel,
-          ctx,
-          prerenderResumeDataCache,
-          createRequestStore,
-          getPayload,
-          onError,
-          validationAbortSignal
-        )
+        const [instantInputs, staticInputs] = await getTracer().trace(
+          AppRenderSpan.instantInsightsPrepareValidation,
+          {
+            spanName: 'Prepare validation inputs',
+            parentSpan: instantInsightsSpan,
+          },
+          async () => {
+            const lazyInputs = await prepareValidationInputs(
+              prefetchMode,
+              navigationKind,
+              result,
+              requestStore,
+              validationDebugChannel,
+              ctx,
+              prerenderResumeDataCache,
+              createRequestStore,
+              getPayload,
+              onError,
+              validationAbortSignal
+            )
 
-        // If we need to do multiple renders, do them in parallel.
-        // `runValidationInDev` currently needs `instantInputs` eagerly
-        // right before using `staticInputs` for static shell validation,
-        // so there's no point delaying one of the renders.
-        // We bail out (after logging an error during `resolveLazyDevValidationInputs`)
-        // if sync IO or invalid dynamic errors happen in either.
-        const [instantInputs, staticInputs] = await Promise.all([
-          lazyInputs.instantInputs
-            ? resolveLazyDevValidationInputs(lazyInputs.instantInputs, ctx)
-            : null,
-          resolveLazyDevValidationInputs(lazyInputs.staticInputs, ctx),
-        ])
+            // If we need to do multiple renders, do them in parallel.
+            // `runValidationInDev` currently needs `instantInputs` eagerly
+            // right before using `staticInputs` for static shell validation,
+            // so there's no point delaying one of the renders.
+            // We bail out (after logging an error during
+            // `resolveLazyDevValidationInputs`) if sync IO or invalid dynamic
+            // errors happen in either.
+            return Promise.all([
+              lazyInputs.instantInputs
+                ? resolveLazyDevValidationInputs(lazyInputs.instantInputs, ctx)
+                : null,
+              resolveLazyDevValidationInputs(lazyInputs.staticInputs, ctx),
+            ])
+          }
+        )
         if (
           instantInputs === VALIDATION_BAILOUT ||
           staticInputs === VALIDATION_BAILOUT
@@ -4551,14 +4565,22 @@ function runDevValidationInBackground(
           return
         }
 
-        return runValidationInDev(
-          prefetchMode,
-          instantInputs,
-          staticInputs,
-          ctx,
-          fallbackRouteParams,
-          devRenderDidError,
-          validationAbortSignal
+        return getTracer().trace(
+          AppRenderSpan.instantInsightsRunValidation,
+          {
+            spanName: 'Run validation',
+            parentSpan: instantInsightsSpan,
+          },
+          () =>
+            runValidationInDev(
+              prefetchMode,
+              instantInputs,
+              staticInputs,
+              ctx,
+              fallbackRouteParams,
+              devRenderDidError,
+              validationAbortSignal
+            )
         )
       })
     })
@@ -4581,7 +4603,7 @@ function runDevValidationInBackground(
 
 async function runInstantInsightsWithTracing<T>(
   ctx: AppRenderContext,
-  fn: () => Promise<T>
+  fn: (span?: Span) => Promise<T>
 ): Promise<T> {
   if (!isRequestInsightsEnabled()) {
     return fn()
@@ -4605,9 +4627,9 @@ async function runInstantInsightsWithTracing<T>(
         },
       })
 
-      return withLocalSpan(span, async () => {
+      return getTracer().withSpan(span, async () => {
         try {
-          return await fn()
+          return await fn(span)
         } catch (err) {
           span.recordException(err as Error)
           span.setStatus({ code: SpanStatusCode.ERROR })
