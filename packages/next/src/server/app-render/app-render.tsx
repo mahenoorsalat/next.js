@@ -96,8 +96,16 @@ import {
 import { isRedirectError } from '../../client/components/redirect-error'
 import { getImplicitTags, type ImplicitTags } from '../lib/implicit-tags'
 import { AppRenderSpan, NextNodeServerSpan } from '../lib/trace/constants'
-import { getRequestInsightsIdentity } from '../lib/trace/request-insights-identity'
+import {
+  getRequestInsightsIdentity,
+  runWithRequestInsightsIdentity,
+} from '../lib/trace/request-insights-identity'
 import { getTracer, SpanStatusCode } from '../lib/trace/tracer'
+import {
+  createLocalSpan,
+  withLocalSpan,
+} from '../lib/trace/local-span-recorder'
+import { isRequestInsightsEnabled } from '../lib/trace/request-insights'
 import { FlightRenderResult } from './flight-render-result'
 import {
   createReactServerErrorHandler,
@@ -4474,83 +4482,85 @@ function runDevValidationInBackground(
         return
       }
 
-      // Read whether the streamed render errored only now that it has fully
-      // settled.
-      const devRenderDidError = getDevRenderDidError()
+      return runInstantInsightsWithTracing(ctx, async () => {
+        // Read whether the streamed render errored only now that it has fully
+        // settled.
+        const devRenderDidError = getDevRenderDidError()
 
-      // A cache-miss render records its `invalidDynamicUsageError` while
-      // filling, so its verdict isn't final until the fills settle. Wait for
-      // that (a no-op when the render didn't miss) before planning, which reads
-      // the work store.
-      if (result.hadCacheMiss) {
-        await cacheSignal.cacheReady()
-      }
+        // A cache-miss render records its `invalidDynamicUsageError` while
+        // filling, so its verdict isn't final until the fills settle. Wait for
+        // that (a no-op when the render didn't miss) before planning, which reads
+        // the work store.
+        if (result.hadCacheMiss) {
+          await cacheSignal.cacheReady()
+        }
 
-      if (validationAbortSignal.aborted) {
-        logValidationAborted(ctx)
-        return
-      }
+        if (validationAbortSignal.aborted) {
+          logValidationAborted(ctx)
+          return
+        }
 
-      // If the initial render recorded invalid dynamic usage errors
-      // (e.g. from caught errors inside "use cache"), we skip validation altogether.
-      if (
-        forwardInvalidDynamicUsageError(
-          ctx.workStore.invalidDynamicUsageError,
-          ctx
+        // If the initial render recorded invalid dynamic usage errors
+        // (e.g. from caught errors inside "use cache"), we skip validation altogether.
+        if (
+          forwardInvalidDynamicUsageError(
+            ctx.workStore.invalidDynamicUsageError,
+            ctx
+          )
+        ) {
+          return
+        }
+
+        const lazyInputs = await prepareValidationInputs(
+          prefetchMode,
+          navigationKind,
+          result,
+          requestStore,
+          validationDebugChannel,
+          ctx,
+          prerenderResumeDataCache,
+          createRequestStore,
+          getPayload,
+          onError,
+          validationAbortSignal
         )
-      ) {
-        return
-      }
 
-      const lazyInputs = await prepareValidationInputs(
-        prefetchMode,
-        navigationKind,
-        result,
-        requestStore,
-        validationDebugChannel,
-        ctx,
-        prerenderResumeDataCache,
-        createRequestStore,
-        getPayload,
-        onError,
-        validationAbortSignal
-      )
+        // If we need to do multiple renders, do them in parallel.
+        // `runValidationInDev` currently needs `instantInputs` eagerly
+        // right before using `staticInputs` for static shell validation,
+        // so there's no point delaying one of the renders.
+        // We bail out (after logging an error during `resolveLazyDevValidationInputs`)
+        // if sync IO or invalid dynamic errors happen in either.
+        const [instantInputs, staticInputs] = await Promise.all([
+          lazyInputs.instantInputs
+            ? resolveLazyDevValidationInputs(lazyInputs.instantInputs, ctx)
+            : null,
+          resolveLazyDevValidationInputs(lazyInputs.staticInputs, ctx),
+        ])
+        if (
+          instantInputs === VALIDATION_BAILOUT ||
+          staticInputs === VALIDATION_BAILOUT
+        ) {
+          return
+        }
 
-      // If we need to do multiple renders, do them in parallel.
-      // `runValidationInDev` currently needs `instantInputs` eagerly
-      // right before using `staticInputs` for static shell validation,
-      // so there's no point delaying one of the renders.
-      // We bail out (after logging an error during `resolveLazyDevValidationInputs`)
-      // if sync IO or invalid dynamic errors happen in either.
-      const [instantInputs, staticInputs] = await Promise.all([
-        lazyInputs.instantInputs
-          ? resolveLazyDevValidationInputs(lazyInputs.instantInputs, ctx)
-          : null,
-        resolveLazyDevValidationInputs(lazyInputs.staticInputs, ctx),
-      ])
-      if (
-        instantInputs === VALIDATION_BAILOUT ||
-        staticInputs === VALIDATION_BAILOUT
-      ) {
-        return
-      }
+        // A newer render may have superseded this work while we prepared the
+        // validation inputs above (which can itself render).
+        if (validationAbortSignal.aborted) {
+          logValidationAborted(ctx)
+          return
+        }
 
-      // A newer render may have superseded this work while we prepared the
-      // validation inputs above (which can itself render).
-      if (validationAbortSignal.aborted) {
-        logValidationAborted(ctx)
-        return
-      }
-
-      return runValidationInDev(
-        prefetchMode,
-        instantInputs,
-        staticInputs,
-        ctx,
-        fallbackRouteParams,
-        devRenderDidError,
-        validationAbortSignal
-      )
+        return runValidationInDev(
+          prefetchMode,
+          instantInputs,
+          staticInputs,
+          ctx,
+          fallbackRouteParams,
+          devRenderDidError,
+          validationAbortSignal
+        )
+      })
     })
     // The catch keeps a failed render, or anything thrown inside validation,
     // from surfacing as an unhandled rejection.
@@ -4567,6 +4577,47 @@ function runDevValidationInBackground(
       )
     })
     .finally(() => validationGeneration.finish())
+}
+
+async function runInstantInsightsWithTracing<T>(
+  ctx: AppRenderContext,
+  fn: () => Promise<T>
+): Promise<T> {
+  if (!isRequestInsightsEnabled()) {
+    return fn()
+  }
+
+  return runWithRequestInsightsIdentity(
+    {
+      requestId: ctx.requestId,
+      kind: 'instant-insights',
+      htmlRequestId: ctx.htmlRequestId,
+      url: ctx.url.href,
+    },
+    () => {
+      const span = createLocalSpan({
+        name: 'Instant Insights',
+        attributes: {
+          'next.span_category': 'nextjs',
+          'next.span_name': 'Instant Insights',
+          'next.span_type': AppRenderSpan.instantInsights,
+          'next.route': ctx.pagePath,
+        },
+      })
+
+      return withLocalSpan(span, async () => {
+        try {
+          return await fn()
+        } catch (err) {
+          span.recordException(err as Error)
+          span.setStatus({ code: SpanStatusCode.ERROR })
+          throw err
+        } finally {
+          span.end()
+        }
+      })
+    }
+  )
 }
 
 /**
