@@ -48,6 +48,7 @@ const DEFAULT_VISIBLE_SPAN_TYPES = new Set([
   'AppRender.instantInsights.runValidation',
   'AppRender.instantInsights.warmupValidation',
   'AppRender.instantInsights.validateStaticShell',
+  'AppRender.instantInsights.prepareRenderAttempts',
   'AppRender.instantInsights.renderAttempt',
   FETCH_SPAN_TYPE,
   'NextNodeServer.waitForFirstResponseChunk',

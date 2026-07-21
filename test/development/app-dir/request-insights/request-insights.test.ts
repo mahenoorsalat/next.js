@@ -191,6 +191,7 @@ describe('request insights', () => {
       const validationPhaseSpanTypes = [
         'AppRender.instantInsights.warmupValidation',
         'AppRender.instantInsights.validateStaticShell',
+        'AppRender.instantInsights.prepareRenderAttempts',
       ]
       const validationPhaseSpans = instantInsights?.spans.filter((span) =>
         validationPhaseSpanTypes.includes(

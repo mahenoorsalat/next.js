@@ -85,7 +85,7 @@ describe('request insights trace viewer', () => {
           name: 'Instant Insights',
           spanId: 'root',
           startTime: 100,
-          durationMs: 50,
+          durationMs: 60,
           attributes: {
             'next.span_type': 'AppRender.instantInsights',
           },
@@ -115,7 +115,7 @@ describe('request insights trace viewer', () => {
           spanId: 'validate',
           parentSpanId: 'root',
           startTime: 125,
-          durationMs: 25,
+          durationMs: 30,
           attributes: {
             'next.span_type': 'AppRender.instantInsights.runValidation',
           },
@@ -124,7 +124,7 @@ describe('request insights trace viewer', () => {
           name: 'Render /dashboard',
           spanId: 'render-dashboard',
           parentSpanId: 'validate',
-          startTime: 134,
+          startTime: 138,
           durationMs: 8,
           attributes: {
             'next.segment': '/dashboard',
@@ -135,7 +135,7 @@ describe('request insights trace viewer', () => {
           name: 'Render /dashboard (runtime retry)',
           spanId: 'render-dashboard-retry',
           parentSpanId: 'validate',
-          startTime: 143,
+          startTime: 147,
           durationMs: 6,
           attributes: {
             'next.segment': '/dashboard',
@@ -162,6 +162,16 @@ describe('request insights trace viewer', () => {
             'next.span_type': 'AppRender.instantInsights.validateStaticShell',
           },
         },
+        {
+          name: 'Prepare render attempts',
+          spanId: 'prepare-render-attempts',
+          parentSpanId: 'validate',
+          startTime: 134,
+          durationMs: 3,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.prepareRenderAttempts',
+          },
+        },
       ],
     })
 
@@ -177,6 +187,7 @@ describe('request insights trace viewer', () => {
       { label: 'Run validation', depth: 1 },
       { label: 'Warm up validation', depth: 2 },
       { label: 'Validate static shell', depth: 2 },
+      { label: 'Prepare render attempts', depth: 2 },
       { label: 'Render /dashboard', depth: 2 },
       { label: 'Render /dashboard (runtime retry)', depth: 2 },
     ])

@@ -6264,31 +6264,56 @@ async function runValidationInDevImpl(
   // Instant validation
   //================================
   if (needsInstantValidation && instantInputs) {
-    if (!(await yieldToForegroundRequest(validationAbortSignal))) {
-      return
-    }
-
-    const inputs = instantInputs
-
-    const debugChunks = inputs.debugChannelClient
-      ? await getDebugChunksOnce(inputs.debugChannelClient)
-      : null
-    const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
-
-    const result = await validateInstantConfigs(
-      prefetchMode,
-      inputs.accumulatedChunks,
-      debugChunks,
-      inputs.startTime,
-      rootParams,
-      fallbackRouteParams,
-      ctx,
-      hmrRefreshHash,
-      validationSamples,
-      devRenderDidError,
-      validationAbortSignal,
-      runValidationSpan
+    const prepareRenderAttemptsSpan = getTracer().startSpan(
+      AppRenderSpan.instantInsightsPrepareRenderAttempts,
+      {
+        spanName: 'Prepare render attempts',
+        parentSpan: runValidationSpan,
+        attributes: {
+          'next.span_name': 'Prepare render attempts',
+          'next.span_type': AppRenderSpan.instantInsightsPrepareRenderAttempts,
+        },
+      }
     )
+    let result: Array<unknown>
+    try {
+      if (!(await yieldToForegroundRequest(validationAbortSignal))) {
+        return
+      }
+
+      const inputs = instantInputs
+
+      const debugChunks = inputs.debugChannelClient
+        ? await getDebugChunksOnce(inputs.debugChannelClient)
+        : null
+      const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
+
+      result = await validateInstantConfigs(
+        prefetchMode,
+        inputs.accumulatedChunks,
+        debugChunks,
+        inputs.startTime,
+        rootParams,
+        fallbackRouteParams,
+        ctx,
+        hmrRefreshHash,
+        validationSamples,
+        devRenderDidError,
+        validationAbortSignal,
+        runValidationSpan,
+        prepareRenderAttemptsSpan
+      )
+    } catch (err) {
+      if (prepareRenderAttemptsSpan.isRecording()) {
+        prepareRenderAttemptsSpan.recordException(err as Error)
+        prepareRenderAttemptsSpan.setStatus({ code: SpanStatusCode.ERROR })
+      }
+      throw err
+    } finally {
+      if (prepareRenderAttemptsSpan.isRecording()) {
+        prepareRenderAttemptsSpan.end()
+      }
+    }
 
     // A newer render superseded this work. Don't surface stale validation
     // errors for a page the user left.
@@ -6750,7 +6775,8 @@ async function validateInstantConfigs(
   validationSamples: ValidationStoreClient['validationSamples'] | null,
   devRenderDidError: boolean,
   validationAbortSignal?: AbortSignal,
-  renderAttemptParentSpan?: Span
+  renderAttemptParentSpan?: Span,
+  prepareRenderAttemptsSpan?: Span
 ): Promise<Array<unknown>> {
   const debug =
     process.env.NEXT_PRIVATE_DEBUG_VALIDATION === '1' ? console.log : undefined
@@ -6868,6 +6894,10 @@ async function validateInstantConfigs(
     const renderAttemptName = `Render ${segmentLabel}${
       previousBoundaryState === null ? '' : ' (runtime retry)'
     }`
+
+    if (prepareRenderAttemptsSpan?.isRecording()) {
+      prepareRenderAttemptsSpan.end()
+    }
 
     const result = await getTracer().trace(
       AppRenderSpan.instantInsightsRenderAttempt,
