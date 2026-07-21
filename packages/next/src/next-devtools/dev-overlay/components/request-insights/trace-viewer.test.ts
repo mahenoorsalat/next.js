@@ -115,7 +115,7 @@ describe('request insights trace viewer', () => {
           spanId: 'validate',
           parentSpanId: 'root',
           startTime: 125,
-          durationMs: 20,
+          durationMs: 25,
           attributes: {
             'next.span_type': 'AppRender.instantInsights.runValidation',
           },
@@ -124,7 +124,7 @@ describe('request insights trace viewer', () => {
           name: 'Render /dashboard',
           spanId: 'render-dashboard',
           parentSpanId: 'validate',
-          startTime: 127,
+          startTime: 134,
           durationMs: 8,
           attributes: {
             'next.segment': '/dashboard',
@@ -135,11 +135,31 @@ describe('request insights trace viewer', () => {
           name: 'Render /dashboard (runtime retry)',
           spanId: 'render-dashboard-retry',
           parentSpanId: 'validate',
-          startTime: 136,
+          startTime: 143,
           durationMs: 6,
           attributes: {
             'next.segment': '/dashboard',
             'next.span_type': 'AppRender.instantInsights.renderAttempt',
+          },
+        },
+        {
+          name: 'Warm up validation',
+          spanId: 'warmup-validation',
+          parentSpanId: 'validate',
+          startTime: 126,
+          durationMs: 3,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.warmupValidation',
+          },
+        },
+        {
+          name: 'Validate static shell',
+          spanId: 'validate-static-shell',
+          parentSpanId: 'validate',
+          startTime: 130,
+          durationMs: 3,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.validateStaticShell',
           },
         },
       ],
@@ -155,6 +175,8 @@ describe('request insights trace viewer', () => {
       { label: 'Wait for cache readiness', depth: 1 },
       { label: 'Prepare validation inputs', depth: 1 },
       { label: 'Run validation', depth: 1 },
+      { label: 'Warm up validation', depth: 2 },
+      { label: 'Validate static shell', depth: 2 },
       { label: 'Render /dashboard', depth: 2 },
       { label: 'Render /dashboard (runtime retry)', depth: 2 },
     ])

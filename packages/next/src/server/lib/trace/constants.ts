@@ -93,6 +93,8 @@ enum AppRenderSpan {
   instantInsightsWaitForCache = 'AppRender.instantInsights.waitForCache',
   instantInsightsPrepareValidation = 'AppRender.instantInsights.prepareValidation',
   instantInsightsRunValidation = 'AppRender.instantInsights.runValidation',
+  instantInsightsWarmupValidation = 'AppRender.instantInsights.warmupValidation',
+  instantInsightsValidateStaticShell = 'AppRender.instantInsights.validateStaticShell',
   instantInsightsRenderAttempt = 'AppRender.instantInsights.renderAttempt',
 }
 

@@ -6146,9 +6146,6 @@ async function runValidationInDevImpl(
   const loaderTree = ComponentMod.routeModule.userland.loaderTree
   const rootParams = getRootParams(loaderTree, getDynamicParamFromSegment)
 
-  const needsInstantValidation =
-    await anySegmentNeedsInstantValidationInDev(loaderTree)
-
   // `samples` from instant config are only used during build
   const validationSamples = null
   const validationSampleTracking = null
@@ -6156,30 +6153,42 @@ async function runValidationInDevImpl(
   //================================
   // Client module warmup
   //================================
-  {
-    // For warmup, we have to use the shared inputs if present -- the static inputs
-    // may not have a proper dynamic stage.
-    const { runtimeChunks, dynamicChunks } = (instantInputs ?? staticInputs)
-      .accumulatedChunks
+  const needsInstantValidation = await getTracer().trace(
+    AppRenderSpan.instantInsightsWarmupValidation,
+    {
+      spanName: 'Warm up validation',
+      parentSpan: runValidationSpan,
+    },
+    async () => {
+      const shouldRunInstantValidation =
+        await anySegmentNeedsInstantValidationInDev(loaderTree)
 
-    // First we warmup SSR with the runtime chunks. This ensures that when we do
-    // the full prerender pass with dynamic tracking module loading won't
-    // interrupt the prerender and can properly observe the entire content
-    await warmupClientModulesForStagedValidation(
-      // if we're going to be validating prefetches, we'll be rendering some segments in the dynamic stage.
-      // otherwise, for static shell validation, we only need to warm up to the runtime stage.
-      // we also need to use a different store type, because instant validation allows more APIs to resolve.
-      needsInstantValidation ? 'validation-client' : 'prerender-client',
-      needsInstantValidation ? dynamicChunks : runtimeChunks,
-      dynamicChunks,
-      rootParams,
-      fallbackRouteParams,
-      ctx,
-      validationSamples,
-      validationSampleTracking,
-      validationAbortSignal
-    )
-  }
+      // For warmup, we have to use the shared inputs if present -- the static inputs
+      // may not have a proper dynamic stage.
+      const { runtimeChunks, dynamicChunks } = (instantInputs ?? staticInputs)
+        .accumulatedChunks
+
+      // First we warmup SSR with the runtime chunks. This ensures that when we do
+      // the full prerender pass with dynamic tracking module loading won't
+      // interrupt the prerender and can properly observe the entire content
+      await warmupClientModulesForStagedValidation(
+        // if we're going to be validating prefetches, we'll be rendering some segments in the dynamic stage.
+        // otherwise, for static shell validation, we only need to warm up to the runtime stage.
+        // we also need to use a different store type, because instant validation allows more APIs to resolve.
+        shouldRunInstantValidation ? 'validation-client' : 'prerender-client',
+        shouldRunInstantValidation ? dynamicChunks : runtimeChunks,
+        dynamicChunks,
+        rootParams,
+        fallbackRouteParams,
+        ctx,
+        validationSamples,
+        validationSampleTracking,
+        validationAbortSignal
+      )
+
+      return shouldRunInstantValidation
+    }
+  )
 
   // React renders used by validation can occupy an entire event-loop turn.
   // Yield between them so a newer navigation can enter app rendering,
@@ -6213,21 +6222,30 @@ async function runValidationInDevImpl(
       return
     }
 
-    const inputs = staticInputs
+    const result = await getTracer().trace(
+      AppRenderSpan.instantInsightsValidateStaticShell,
+      {
+        spanName: 'Validate static shell',
+        parentSpan: runValidationSpan,
+      },
+      async () => {
+        const inputs = staticInputs
 
-    const debugChunks = inputs.debugChannelClient
-      ? await getDebugChunksOnce(inputs.debugChannelClient)
-      : null
-    const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
+        const debugChunks = inputs.debugChannelClient
+          ? await getDebugChunksOnce(inputs.debugChannelClient)
+          : null
+        const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
 
-    const result = await validateStaticShell(
-      inputs,
-      ctx,
-      rootParams,
-      fallbackRouteParams,
-      debugChunks,
-      hmrRefreshHash,
-      validationAbortSignal
+        return validateStaticShell(
+          inputs,
+          ctx,
+          rootParams,
+          fallbackRouteParams,
+          debugChunks,
+          hmrRefreshHash,
+          validationAbortSignal
+        )
+      }
     )
     // A newer render superseded this validation while its render ran, so its
     // result is stale. Don't surface errors for a page the user left.

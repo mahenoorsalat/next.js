@@ -188,6 +188,26 @@ describe('request insights', () => {
           span.attributes?.['next.span_type'] ===
           'AppRender.instantInsights.runValidation'
       )
+      const validationPhaseSpanTypes = [
+        'AppRender.instantInsights.warmupValidation',
+        'AppRender.instantInsights.validateStaticShell',
+      ]
+      const validationPhaseSpans = instantInsights?.spans.filter((span) =>
+        validationPhaseSpanTypes.includes(
+          span.attributes?.['next.span_type'] as string
+        )
+      )
+      expect(
+        validationPhaseSpans?.map((span) => span.attributes?.['next.span_type'])
+      ).toEqual(expect.arrayContaining(validationPhaseSpanTypes))
+      for (const span of validationPhaseSpans ?? []) {
+        expect(
+          runValidationSpans?.some(
+            (runValidationSpan) =>
+              runValidationSpan.spanId === span.parentSpanId
+          )
+        ).toBe(true)
+      }
       const renderAttemptSpans = instantInsights?.spans.filter(
         (span) =>
           span.attributes?.['next.span_type'] ===
@@ -210,6 +230,9 @@ describe('request insights', () => {
             span.attributes?.['next.span_type'] ===
               'AppRender.instantInsights' ||
             pipelineSpanTypes.includes(
+              span.attributes?.['next.span_type'] as string
+            ) ||
+            validationPhaseSpanTypes.includes(
               span.attributes?.['next.span_type'] as string
             ) ||
             span.attributes?.['next.span_type'] ===
