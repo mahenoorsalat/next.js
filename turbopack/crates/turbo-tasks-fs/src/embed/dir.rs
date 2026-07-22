@@ -7,7 +7,9 @@ use anyhow::Result;
 use turbo_rcstr::RcStr;
 use turbo_tasks::Vc;
 
-use crate::{DiskFileSystem, FileSystem, canonicalize_to_rcstr, embed::EmbeddedFileSystem};
+use crate::{
+    DiskFileSystem, DiskWatcherConfig, FileSystem, canonicalize_to_rcstr, embed::EmbeddedFileSystem,
+};
 
 #[turbo_tasks::function]
 pub async fn directory_from_relative_path(
@@ -19,7 +21,10 @@ pub async fn directory_from_relative_path(
     // development and the root directory is unlikely to move.
     let root = canonicalize_to_rcstr(Path::new(&*path))?;
     let disk_fs = DiskFileSystem::new(name, Vc::cell(root));
-    disk_fs.await?.start_watching(None).await?;
+    disk_fs
+        .await?
+        .start_watching(DiskWatcherConfig::default())
+        .await?;
 
     Ok(Vc::upcast(disk_fs))
 }

@@ -19,12 +19,15 @@ use notify::{
     event::{MetadataKind, ModifyKind, RenameMode},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Serialize;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use tracing::instrument;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
-    FxIndexSet, InvalidationReason, InvalidationReasonKind, Invalidator, TurboTasksApi, parallel,
-    spawn_thread, util::StaticOrArc,
+    FxIndexSet, InvalidationReason, InvalidationReasonKind, Invalidator, TurboTasksApi,
+    message_queue::{CompilationEvent, Severity},
+    parallel, spawn_thread,
+    util::StaticOrArc,
 };
 
 use crate::{
@@ -62,17 +65,59 @@ static WATCH_RECURSIVE_MODE: LazyLock<RecursiveMode> = LazyLock::new(|| {
     }
 });
 
-/// How long to extend an invalidation batch by when receiving new events, before flushing. This
-/// reduces invalidations if the same file or directory is modified many times.
-///
-/// Linux watching is too fast, so we need a longer delay there to avoid reading wip files.
-#[cfg(target_os = "linux")]
-const BATCH_DELAY: Duration = Duration::from_millis(10);
-#[cfg(not(target_os = "linux"))]
-const BATCH_DELAY: Duration = Duration::from_millis(1);
+/// A predicate over the absolute paths reported by the filesystem watcher. See
+/// [`DiskWatcherConfig::extended_batch_delay_matcher`].
+pub type PathMatcher = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+/// Tunables for the filesystem watcher, passed to [`crate::DiskFileSystem::start_watching`].
+/// Defaults are appropriate for a generic watcher; consumers (e.g. a bundler front-end) can extend
+/// the batch delay for noisy directories like package-manager install targets.
+#[derive(Clone)]
+pub struct DiskWatcherConfig {
+    /// When set, poll the filesystem at this interval instead of using the platform's native
+    /// filesystem notification API.
+    pub poll_interval: Option<Duration>,
+    /// How long to keep a batch of filesystem events open, waiting for more events, before
+    /// flushing invalidations. Batching coalesces bursts (e.g. a `git checkout`) into a single
+    /// invalidation pass and avoids reading half-written files.
+    pub batch_delay: Duration,
+    /// Predicate over the absolute paths reported by the watcher. Whenever an event matches, the
+    /// current batch is held open until [`Self::extended_batch_delay_duration`] has passed without
+    /// another match, instead of the usual [`Self::batch_delay`].
+    ///
+    /// This is a sliding window, so sustained changes to matching paths (e.g. a package manager
+    /// installing dependencies) keep the batch open for as long as they continue. That's the point
+    /// — such a directory is unusable until the writer is done — but it means invalidation of
+    /// *every* path in the batch is deferred, which is why [`FilesystemSettlingEvent`] exists.
+    pub extended_batch_delay_matcher: Option<PathMatcher>,
+    /// The quiet period required to close a batch once [`Self::extended_batch_delay_matcher`] has
+    /// matched. Unused when there is no matcher.
+    pub extended_batch_delay_duration: Duration,
+    /// If a single batch stays open at least this long, emit a [`FilesystemSettlingEvent`]
+    /// compilation event so the user knows why work has stalled. Repeated events within the same
+    /// batch back off exponentially, up to [`Self::compilation_event_max_delay`].
+    pub compilation_event_delay: Duration,
+    /// Upper bound for the exponentially increasing interval between repeated
+    /// [`FilesystemSettlingEvent`]s within a single batch.
+    pub compilation_event_max_delay: Duration,
+}
+
+impl Default for DiskWatcherConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: None,
+            batch_delay: Duration::from_millis(10),
+            extended_batch_delay_matcher: None,
+            extended_batch_delay_duration: Duration::from_millis(200),
+            compilation_event_delay: Duration::from_secs(3),
+            compilation_event_max_delay: Duration::from_secs(60),
+        }
+    }
+}
 
 #[derive(Encode, Decode)]
 pub(crate) struct DiskWatcher {
+    /// Not serialized: Always constructed with [`State::new_stopped`]
     #[bincode(skip)]
     state: State,
 }
@@ -379,7 +424,7 @@ impl DiskWatcher {
         &self,
         fs_inner: Arc<DiskFileSystemInner>,
         report_invalidation_reason: bool,
-        poll_interval: Option<Duration>,
+        watcher_config: DiskWatcherConfig,
     ) -> Result<()> {
         let state_guard = self.state.write().await;
 
@@ -403,7 +448,7 @@ impl DiskWatcher {
         // turbo-tasks-fs
         let config = config.with_follow_symlinks(false);
 
-        let mut notify_watcher = if let Some(poll_interval) = poll_interval {
+        let mut notify_watcher = if let Some(poll_interval) = watcher_config.poll_interval {
             let config = config.with_poll_interval(poll_interval);
             NotifyWatcher::Polling(PollWatcher::new(tx, config)?)
         } else {
@@ -454,10 +499,12 @@ impl DiskWatcher {
         }
 
         spawn_thread(move || {
-            fs_inner
-                .clone()
-                .watcher
-                .watch_thread(rx, fs_inner, report_invalidation_reason)
+            fs_inner.clone().watcher.watch_thread(
+                rx,
+                fs_inner,
+                report_invalidation_reason,
+                watcher_config,
+            )
         });
 
         // Updating `self.state` is done last. If we panic while setting up the watcher, it'll
@@ -497,19 +544,60 @@ impl DiskWatcher {
         rx: Receiver<notify::Result<notify::Event>>,
         fs_inner: Arc<DiskFileSystemInner>,
         report_invalidation_reason: bool,
+        config: DiskWatcherConfig,
     ) {
         let mut batch = BatchedInvalidations::new(self.state.recursive_mode());
 
+        // Waits for the next event of the current batch, reporting `Timeout` only once the batch is
+        // complete (i.e. once `deadline` has passed). Batching coalesces bursts (e.g. a `git
+        // checkout`) into a single invalidation pass and avoids reading half-written files. A
+        // `None` deadline means the batch is still empty, so there's nothing to flush:
+        // block until it opens.
+        //
+        // Because the extended delay can hold a batch open for as long as a writer keeps working,
+        // we also emit `FilesystemSettlingEvent`s on `settling`'s schedule while waiting, so the
+        // user learns why nothing has recompiled.
+        let drain_next = |deadline: Option<Instant>,
+                          settling: &mut SettlingSchedule|
+         -> Result<notify::Result<notify::Event>, RecvTimeoutError> {
+            let Some(deadline) = deadline else {
+                return rx.recv().map_err(|_| RecvTimeoutError::Disconnected);
+            };
+            loop {
+                let wake = deadline.min(settling.next_event_at);
+                match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+                    Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {
+                        settling.emit(&fs_inner)
+                    }
+                    result => return result,
+                }
+            }
+        };
+
+        // Pushes `deadline` out to at least `now + delay`, never moving it backwards. The first
+        // event to contribute to a batch opens it, which is also when its settling schedule starts:
+        // `FilesystemSettlingEvent` reports how long the batch has been held open, not how long the
+        // watcher sat idle waiting for one to open.
+        let extend_batch = |deadline: &mut Option<Instant>,
+                            settling: &mut SettlingSchedule<'_>,
+                            delay: Duration| {
+            let now = Instant::now();
+            match *deadline {
+                Some(current) => *deadline = Some(current.max(now + delay)),
+                None => {
+                    settling.restart(now);
+                    *deadline = Some(now + delay);
+                }
+            }
+        };
+
         'outer: loop {
             let mut deadline: Option<Instant> = None;
+            // Placeholder start time; `extend_batch` resets this when the batch opens.
+            let mut settling = SettlingSchedule::new(&config, Instant::now());
+
             loop {
-                let event_result = match deadline {
-                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                    Some(deadline) => {
-                        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    }
-                };
-                match event_result {
+                match drain_next(deadline, &mut settling) {
                     Ok(Ok(event)) => {
                         // TODO: We might benefit from some user-facing diagnostics if it rescans
                         // occur frequently (i.e. more than X times in Y minutes)
@@ -557,10 +645,19 @@ impl DiskWatcher {
                             break;
                         }
 
-                        // Only an event that contributes to the batch keeps it open for another
-                        // `BATCH_DELAY`.
+                        // Any event that contributes to the batch keeps it open for another
+                        // `batch_delay`. A path matching `extended_batch_delay_matcher` (e.g. a
+                        // package-manager install target) keeps it open for
+                        // `extended_batch_delay_duration` instead.
+                        let mut delay = config.batch_delay;
+                        if let Some(matcher) = &config.extended_batch_delay_matcher
+                            && event.paths.iter().any(|path| matcher(path))
+                        {
+                            delay = delay.max(config.extended_batch_delay_duration);
+                        }
+
                         if batch.add_event(event) {
-                            deadline = Some(Instant::now() + BATCH_DELAY);
+                            extend_batch(&mut deadline, &mut settling, delay);
                         }
                     }
                     // Error raised by notify watcher itself
@@ -576,10 +673,11 @@ impl DiskWatcher {
                                 batch.mark(path.into_boxed_path(), flags);
                             }
                         }
-                        deadline = Some(Instant::now() + BATCH_DELAY);
+                        extend_batch(&mut deadline, &mut settling, config.batch_delay);
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        // The batch is complete: break out to invalidate the collected paths.
+                        // `drain_next` only reports a timeout once `deadline` has passed, so the
+                        // batch is complete: break out to invalidate the collected paths.
                         break;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
@@ -883,6 +981,83 @@ fn invalidate(
         return;
     }
     invalidator.invalidate(turbo_tasks);
+}
+
+/// Schedules the repeated [`FilesystemSettlingEvent`] for a single batch of watcher events. The
+/// interval grows exponentially so that a writer holding a batch open for minutes doesn't flood the
+/// compilation event queue.
+struct SettlingSchedule<'a> {
+    config: &'a DiskWatcherConfig,
+    batch_started: Instant,
+    /// When the next event should be emitted.
+    next_event_at: Instant,
+    /// The interval that led up to [`Self::next_event_at`].
+    interval: Duration,
+}
+
+impl<'a> SettlingSchedule<'a> {
+    fn new(config: &'a DiskWatcherConfig, batch_started: Instant) -> Self {
+        Self {
+            config,
+            batch_started,
+            next_event_at: batch_started + config.compilation_event_delay,
+            interval: config.compilation_event_delay,
+        }
+    }
+
+    /// Restarts the schedule, as if the batch had just opened at `batch_started`.
+    fn restart(&mut self, batch_started: Instant) {
+        *self = Self::new(self.config, batch_started);
+    }
+
+    fn emit(&mut self, fs_inner: &DiskFileSystemInner) {
+        let _guard = fs_inner.tokio_handle.enter();
+        if let Some(turbo_tasks) = fs_inner.turbo_tasks.upgrade() {
+            turbo_tasks.send_compilation_event(Arc::new(FilesystemSettlingEvent {
+                elapsed_secs: self.batch_started.elapsed().as_secs(),
+            }));
+        }
+        self.interval = (self.interval * 2).min(self.config.compilation_event_max_delay);
+        // Schedule from "now" instead of accumulating intervals, so that emitting late (e.g. under
+        // heavy load) doesn't produce a catch-up burst of events.
+        self.next_event_at = Instant::now() + self.interval;
+    }
+}
+
+/// Emitted while the watcher is holding a batch of filesystem events open, waiting for frequent
+/// updates (e.g. a running package manager) to settle before invalidating. Because the batch delay
+/// can be extended for as long as those updates continue, this event lets consumers surface why
+/// work appears stalled.
+///
+/// Repeated for as long as the batch stays open, at an exponentially increasing interval starting
+/// at [`DiskWatcherConfig::compilation_event_delay`] and capped at
+/// [`DiskWatcherConfig::compilation_event_max_delay`].
+#[derive(Debug, Clone, Serialize)]
+pub struct FilesystemSettlingEvent {
+    /// How long the current batch has been held open, in whole seconds.
+    pub elapsed_secs: u64,
+}
+
+impl CompilationEvent for FilesystemSettlingEvent {
+    fn type_name(&self) -> &'static str {
+        "FilesystemSettlingEvent"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Info
+    }
+
+    fn message(&self) -> String {
+        format!(
+            "Turbopack has seen frequent file updates and is waiting for the filesystem to settle \
+             ({}s elapsed).",
+            self.elapsed_secs
+        )
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
 }
 
 /// Invalidation was caused by a watcher rescan event. This will likely invalidate *every* watched

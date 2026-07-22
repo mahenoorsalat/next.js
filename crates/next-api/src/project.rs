@@ -1,4 +1,9 @@
-use std::{path::Path, time::Duration};
+use std::{
+    ffi::OsStr,
+    path::{Component, Path},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -45,7 +50,7 @@ use turbo_tasks::{
 };
 use turbo_tasks_env::{EnvMap, ProcessEnv};
 use turbo_tasks_fs::{
-    DiskFileSystem, FileContent, FileSystem, FileSystemPath, VirtualFileSystem,
+    DiskFileSystem, DiskWatcherConfig, FileContent, FileSystem, FileSystemPath, VirtualFileSystem,
     canonicalize_to_rcstr, invalidation,
 };
 use turbo_unix_path::join_path;
@@ -153,6 +158,25 @@ pub struct WatchOptions {
     /// Enable polling at a certain interval if the native file watching doesn't work (e.g.
     /// docker).
     pub poll_interval: Option<Duration>,
+}
+
+impl WatchOptions {
+    fn disk_watcher_config(&self) -> DiskWatcherConfig {
+        // Package managers churn `node_modules` heavily while the dev server is running (e.g.
+        // `pnpm install`). Hold the watcher's batch open while those paths keep changing, so we
+        // coalesce the churn into fewer invalidation passes, reducing CPU usage and transient read
+        // errors from half-written files.
+        fn is_in_node_modules(path: &Path) -> bool {
+            path.components()
+                .any(|component| component == Component::Normal(OsStr::new("node_modules")))
+        }
+
+        DiskWatcherConfig {
+            poll_interval: self.poll_interval,
+            extended_batch_delay_matcher: Some(Arc::new(is_in_node_modules)),
+            ..Default::default()
+        }
+    }
 }
 
 #[turbo_tasks::task_input]
@@ -629,7 +653,7 @@ impl ProjectContainer {
                 .await?;
             if watch.enable {
                 project_fs
-                    .start_watching_with_invalidation_reason(watch.poll_interval)
+                    .start_watching_with_invalidation_reason(watch.disk_watcher_config())
                     .await?;
             } else {
                 project_fs.invalidate_with_reason(|path| invalidation::Initialize {
@@ -774,7 +798,7 @@ impl ProjectContainer {
                 if watch.enable {
                     // TODO stop watching: prev_project_fs.stop_watching()?;
                     project_fs
-                        .start_watching_with_invalidation_reason(watch.poll_interval)
+                        .start_watching_with_invalidation_reason(watch.disk_watcher_config())
                         .await?;
                 } else {
                     project_fs.invalidate_with_reason(|path| invalidation::Initialize {

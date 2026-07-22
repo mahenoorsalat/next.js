@@ -20,7 +20,8 @@ use turbo_tasks::{
 };
 use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
 use turbo_tasks_fs::{
-    DiskFileSystem, File, FileContent, FileSystem, FileSystemPath, LinkContent, LinkType,
+    DiskFileSystem, DiskWatcherConfig, File, FileContent, FileSystem, FileSystemPath, LinkContent,
+    LinkType,
 };
 
 // `read_or_write_all_paths_operation` always writes the sentinel values to files/symlinks. We can
@@ -129,7 +130,10 @@ pub async fn run(args: FsWatcher) -> anyhow::Result<()> {
         };
 
         if !args.start_watching_late {
-            project_fs.await?.start_watching(None).await?;
+            project_fs
+                .await?
+                .start_watching(DiskWatcherConfig::default())
+                .await?;
         }
 
         let symlink_count = if args.symlinks.is_some() {
@@ -175,7 +179,10 @@ pub async fn run(args: FsWatcher) -> anyhow::Result<()> {
         invalidations.0.lock().unwrap().clear();
 
         if args.start_watching_late {
-            project_fs.await?.start_watching(None).await?;
+            project_fs
+                .await?
+                .start_watching(DiskWatcherConfig::default())
+                .await?;
         }
 
         let mut rand_buf = [0; 16];

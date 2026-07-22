@@ -14,7 +14,8 @@ use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{ReadConsistency, TurboTasks, UpdateInfo, Vc, util::FormatDuration};
 use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
 use turbo_tasks_fs::{
-    DirectoryContent, DirectoryEntry, DiskFileSystem, FileContent, FileSystem, FileSystemPath,
+    DirectoryContent, DirectoryEntry, DiskFileSystem, DiskWatcherConfig, FileContent, FileSystem,
+    FileSystemPath,
 };
 
 #[tokio::main]
@@ -29,7 +30,10 @@ async fn main() -> Result<()> {
         Box::pin(async {
             let root = RcStr::from(current_dir().unwrap().to_str().unwrap());
             let disk_fs = DiskFileSystem::new(rcstr!("project"), Vc::cell(root));
-            disk_fs.await?.start_watching(None).await?;
+            disk_fs
+                .await?
+                .start_watching(DiskWatcherConfig::default())
+                .await?;
 
             // Smart Pointer cast
             let fs: Vc<Box<dyn FileSystem>> = Vc::upcast(disk_fs);

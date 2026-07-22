@@ -9,7 +9,6 @@ use std::{
     mem::take,
     path::{MAIN_SEPARATOR, Path, PathBuf},
     sync::{Arc, LazyLock, Weak},
-    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,7 +41,7 @@ use crate::{
     mutex_map::MutexMap,
     path_map::OrderedPathMapExt,
     retry::{can_retry, retry_blocking, retry_blocking_custom},
-    watcher::DiskWatcher,
+    watcher::{DiskWatcher, DiskWatcherConfig},
 };
 
 /// Validate the path, returning the valid path, a modified-but-now-valid path, or bailing with an
@@ -448,7 +447,7 @@ impl DiskFileSystemInner {
     async fn start_watching_internal(
         self: &Arc<Self>,
         report_invalidation_reason: bool,
-        poll_interval: Option<Duration>,
+        watcher_config: DiskWatcherConfig,
     ) -> Result<()> {
         let root_path = self.root_path().to_path_buf();
 
@@ -459,7 +458,7 @@ impl DiskFileSystemInner {
             .await?;
 
         self.watcher
-            .start_watching(self.clone(), report_invalidation_reason, poll_interval)
+            .start_watching(self.clone(), report_invalidation_reason, watcher_config)
             .await?;
 
         Ok(())
@@ -507,18 +506,18 @@ impl DiskFileSystem {
             .invalidate_path_and_children_with_reason(paths, reason);
     }
 
-    pub async fn start_watching(&self, poll_interval: Option<Duration>) -> Result<()> {
+    pub async fn start_watching(&self, watcher_config: DiskWatcherConfig) -> Result<()> {
         self.inner
-            .start_watching_internal(false, poll_interval)
+            .start_watching_internal(false, watcher_config)
             .await
     }
 
     pub async fn start_watching_with_invalidation_reason(
         &self,
-        poll_interval: Option<Duration>,
+        watcher_config: DiskWatcherConfig,
     ) -> Result<()> {
         self.inner
-            .start_watching_internal(true, poll_interval)
+            .start_watching_internal(true, watcher_config)
             .await
     }
 
