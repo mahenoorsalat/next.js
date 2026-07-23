@@ -243,6 +243,47 @@ describe('request insights', () => {
     })
   })
 
+  it('does not include request values in render attempt spans', async () => {
+    const paramValue = 'private-param-value'
+    const searchValue = 'private-search-value'
+    await next.render(`/instant-insights/${paramValue}?token=${searchValue}`)
+
+    await retry(async () => {
+      const snapshot = (await next
+        .fetch('/_next/development/request-insights')
+        .then((response) => response.json())) as {
+        requests: RequestInsight[]
+      }
+      const instantInsight = snapshot.requests.find(
+        (request) =>
+          request.kind === 'instant-insights' &&
+          request.route === '/instant-insights/[slug]'
+      )
+      const renderAttemptSpans = instantInsight?.spans.filter(
+        (span) =>
+          span.attributes?.['next.span_type'] ===
+          'AppRender.instantInsights.renderAttempt'
+      )
+
+      expect(renderAttemptSpans?.length).toBeGreaterThan(0)
+      for (const span of renderAttemptSpans ?? []) {
+        expect(span.name).not.toContain(paramValue)
+        expect(span.name).not.toContain(searchValue)
+        expect(span.attributes?.['next.segment']).not.toContain(paramValue)
+        expect(span.attributes?.['next.segment']).not.toContain(searchValue)
+      }
+      expect(
+        renderAttemptSpans?.some((span) => span.name?.includes('[slug]'))
+      ).toBe(true)
+      expect(
+        renderAttemptSpans?.some((span) => {
+          const segment = span.attributes?.['next.segment']
+          return typeof segment === 'string' && segment.includes('[slug]')
+        })
+      ).toBe(true)
+    })
+  })
+
   it('uses the development endpoint and reports truncated output', async () => {
     const { result, requestedPaths } = await runWithResponse(
       {

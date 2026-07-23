@@ -179,6 +179,16 @@ function createChildSegmentPath(
   return `${parentPath}/${parallelRoutePrefix}${stringifySegment(segment)}` as SegmentPath
 }
 
+function createChildSegmentLabel(
+  parentLabel: string,
+  parallelRouteKey: string,
+  segment: string
+): string {
+  const parallelRoutePrefix =
+    parallelRouteKey === 'children' ? '' : `@${parallelRouteKey}/`
+  return `${parentLabel}/${parallelRoutePrefix}${segment}`
+}
+
 function stringifySegment(segment: Segment): SegmentPath {
   return (
     typeof segment === 'string'
@@ -996,6 +1006,7 @@ export async function createCombinedPayloadAtDepth(
   async function buildSharedTreeSeedData(
     loaderTree: LoaderTree,
     parentPath: SegmentPath | null,
+    parentLabel: string | null,
     key: string | null,
     urlDepthConsumed: number,
     groupDepthConsumed: number
@@ -1003,10 +1014,15 @@ export async function createCombinedPayloadAtDepth(
     const { parallelRoutes } = parseLoaderTree(loaderTree)
 
     const segment = getSegment(loaderTree)
+    const labelSegment = loaderTree[0]
     const path: SegmentPath =
       parentPath === null
         ? stringifySegment(segment)
         : createChildSegmentPath(parentPath, key!, segment)
+    const label =
+      parentLabel === null
+        ? labelSegment
+        : createChildSegmentLabel(parentLabel, key!, labelSegment)
 
     debug?.(`    ${path || '/'} - Dynamic`)
     const segmentCacheItem = cache.segments.get(path)
@@ -1106,6 +1122,7 @@ export async function createCombinedPayloadAtDepth(
       // render (e.g. conditionally excluded by a layout).
       if (requiresInstantUI) {
         boundaryState.requiredIds.set(path, slotModFilePaths)
+        boundaryState.boundaryLabels.set(path, label || '/')
       }
 
       wrapSlotsWithMarkers(slots, slotResults)
@@ -1130,6 +1147,7 @@ export async function createCombinedPayloadAtDepth(
       const result = await buildSharedTreeSeedData(
         parallelRoutes[parallelRouteKey],
         path,
+        label,
         parallelRouteKey,
         nextUrlDepth,
         currentGroupDepth
@@ -1358,6 +1376,7 @@ export async function createCombinedPayloadAtDepth(
     await buildSharedTreeSeedData(
       initialLoaderTree,
       null /* parentPath */,
+      null /* parentLabel */,
       null /* key */,
       0 /* urlDepthConsumed */,
       0 /* groupDepthConsumed */

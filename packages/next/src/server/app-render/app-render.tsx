@@ -6264,17 +6264,20 @@ async function runValidationInDevImpl(
   // Instant validation
   //================================
   if (needsInstantValidation && instantInputs) {
-    const prepareRenderAttemptsSpan = getTracer().startSpan(
-      AppRenderSpan.instantInsightsPrepareRenderAttempts,
-      {
-        spanName: 'Prepare render attempts',
-        parentSpan: runValidationSpan,
-        attributes: {
-          'next.span_name': 'Prepare render attempts',
-          'next.span_type': AppRenderSpan.instantInsightsPrepareRenderAttempts,
-        },
-      }
-    )
+    const prepareRenderAttemptsSpan = runValidationSpan
+      ? getTracer().startSpan(
+          AppRenderSpan.instantInsightsPrepareRenderAttempts,
+          {
+            spanName: 'Prepare render attempts',
+            parentSpan: runValidationSpan,
+            attributes: {
+              'next.span_name': 'Prepare render attempts',
+              'next.span_type':
+                AppRenderSpan.instantInsightsPrepareRenderAttempts,
+            },
+          }
+        )
+      : undefined
     let result: Array<unknown>
     try {
       if (!(await yieldToForegroundRequest(validationAbortSignal))) {
@@ -6304,13 +6307,13 @@ async function runValidationInDevImpl(
         prepareRenderAttemptsSpan
       )
     } catch (err) {
-      if (prepareRenderAttemptsSpan.isRecording()) {
+      if (prepareRenderAttemptsSpan?.isRecording()) {
         prepareRenderAttemptsSpan.recordException(err as Error)
         prepareRenderAttemptsSpan.setStatus({ code: SpanStatusCode.ERROR })
       }
       throw err
     } finally {
-      if (prepareRenderAttemptsSpan.isRecording()) {
+      if (prepareRenderAttemptsSpan?.isRecording()) {
         prepareRenderAttemptsSpan.end()
       }
     }
@@ -6864,6 +6867,9 @@ async function validateInstantConfigs(
       for (const [id, filePath] of previousBoundaryState.requiredIds) {
         boundaryState.requiredIds.set(id, filePath)
       }
+      for (const [id, label] of previousBoundaryState.boundaryLabels) {
+        boundaryState.boundaryLabels.set(id, label)
+      }
     }
 
     const payloadResult = await createCombinedPayloadAtDepth(
@@ -6888,7 +6894,7 @@ async function validateInstantConfigs(
 
     const segmentPaths = Array.from(
       boundaryState.requiredIds.keys(),
-      (segmentPath) => segmentPath || '/'
+      (segmentPath) => boundaryState.boundaryLabels.get(segmentPath) ?? '/'
     )
     const segmentLabel = segmentPaths.length > 0 ? segmentPaths.join(', ') : '/'
     const renderAttemptName = `Render ${segmentLabel}${

@@ -7,12 +7,18 @@ export type ValidationBoundaryTracking = {
    * reported together.
    */
   requiredIds: Map<string, string[]>
+  /**
+   * Source-defined route labels for each boundary. Unlike the boundary id,
+   * these do not contain dynamic parameter or search parameter values.
+   */
+  boundaryLabels: Map<string, string>
   renderedIds: Set<string>
 }
 
 export function createValidationBoundaryTracking(): ValidationBoundaryTracking {
   return {
     requiredIds: new Map(),
+    boundaryLabels: new Map(),
     renderedIds: new Set(),
   }
 }
