@@ -6,21 +6,21 @@ import { cacheLife, cacheTag, unstable_cache } from 'next/cache'
 // same token-pair cross-render divergence mechanism (see that fixture for
 // the full explanation of the tagged current token, the unstable_cache-
 // captured copy, and the /api/diverge endpoint that flips and resets the
-// pair), but with RUNTIME prefetching enabled (`allow-runtime`) so the page
-// segment requires runtime-completeness during the Speculative phase, too —
-// the phase the consuming test exercises via a `prefetch={true}` link.
+// pair), exercised during the Speculative phase — as a Partial Prefetching
+// segment the page requires runtime-completeness there, too. The consuming
+// test enters the phase via a `prefetch={true}` link.
 //
 // The choreography is identical: the client fetches the route tree while
 // its static-prefetch hint is SET (from a stale, clean render), but by the
 // time the static segment prefetches hit the server, a diverged render
 // records a cookies() access in the shell stage — the static attempt is
 // insufficient and the batched runtime fallback fires. And because a
-// runtime prefetch of an allow-runtime segment resolves cookies() reads
+// Speculative runtime prefetch resolves cookies() reads
 // (see app/speculative-cookies/page.tsx) — the token pair is fully cached
 // by the time the fallback renders, so the comparison resolves and the
 // read is reached — the session content itself arrives in the runtime
 // fallback response.
-export const prefetch = 'allow-runtime'
+export const prefetch = 'partial'
 
 async function getCurrentToken(): Promise<number> {
   'use cache'

@@ -45,7 +45,7 @@ export default function Page() {
             Divergent cookies after shell
           </LinkAccordion>
         </li>
-        {/* The speculative-* routes are allow-runtime (non-eager), so their
+        {/* The speculative-* routes are partial (non-eager), so their
             links use prefetch={true} to opt into the Speculative phase —
             otherwise only their App Shell would be prefetched. */}
         <li>
