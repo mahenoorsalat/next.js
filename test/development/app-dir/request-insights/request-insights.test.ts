@@ -1,7 +1,7 @@
 import { nextTestSetup } from 'e2e-utils'
 import { createServer } from 'http'
 import type { AddressInfo } from 'net'
-import { retry } from 'next-test-utils'
+import { retry, toggleDevToolsIndicatorPopover } from 'next-test-utils'
 
 type RequestInsight = {
   requestId: string
@@ -281,6 +281,174 @@ describe('request insights', () => {
           return typeof segment === 'string' && segment.includes('[slug]')
         })
       ).toBe(true)
+    })
+  })
+
+  it('hides internal activity behind the settings menu', async () => {
+    const browser = await next.browser('/instant-insights')
+
+    async function openRequestInsightsPanel() {
+      await toggleDevToolsIndicatorPopover(browser)
+      await browser.elementByCss('[data-request-insights]').click()
+      await browser.waitForElementByCss('.request-insights-list-toolbar')
+      // The panel selector menu stays mounted for its exit animation and its
+      // click-outside handler would close the freshly opened panel. Wait for
+      // it to fully unmount before interacting with the panel.
+      await retry(async () => {
+        const selectorMenuGone = await browser.eval(() => {
+          const root = document.querySelector('nextjs-portal')?.shadowRoot
+          return !root?.querySelector('#nextjs-dev-tools-menu')
+        })
+        expect(selectorMenuGone).toBe(true)
+      })
+    }
+
+    function getSettingsMenuState(): Promise<{
+      open: boolean
+      items: Array<{ label: string | undefined; checked: string | null }>
+    }> {
+      return browser.eval(() => {
+        const root = document.querySelector('nextjs-portal')?.shadowRoot
+        return {
+          open: !!root?.querySelector('.request-insights-settings-menu'),
+          items: Array.from(
+            root?.querySelectorAll('.request-insights-settings-item') ?? []
+          ).map((item) => ({
+            label: item.textContent?.trim(),
+            checked:
+              item
+                .querySelector('.request-insights-settings-checkbox')
+                ?.getAttribute('data-checked') ?? null,
+          })),
+        }
+      })
+    }
+
+    function getSpanRowCount(): Promise<number> {
+      return browser.eval(() => {
+        const root = document.querySelector('nextjs-portal')?.shadowRoot
+        return root?.querySelectorAll('.request-insights-span-row').length ?? 0
+      })
+    }
+
+    await openRequestInsightsPanel()
+
+    // Internal activity is hidden by default; only the settings trigger hints
+    // at it.
+    await retry(async () => {
+      const state = await browser.eval(() => {
+        const root = document.querySelector('nextjs-portal')?.shadowRoot
+        const rows = Array.from(
+          root?.querySelectorAll('.request-insights-row') ?? []
+        )
+        return {
+          rowCount: rows.length,
+          hasInstantInsightsRow: rows.some((row) =>
+            row.textContent?.includes('Instant Insights')
+          ),
+          hasSettingsTrigger: !!root?.querySelector(
+            '.request-insights-settings-trigger'
+          ),
+        }
+      })
+
+      expect(state.rowCount).toBeGreaterThan(0)
+      expect(state.hasInstantInsightsRow).toBe(false)
+      expect(state.hasSettingsTrigger).toBe(true)
+    })
+
+    await browser.elementByCss('.request-insights-settings-trigger').click()
+
+    await retry(async () => {
+      const menu = await getSettingsMenuState()
+
+      expect(menu.open).toBe(true)
+      expect(menu.items).toEqual([
+        { label: 'Internal activity', checked: null },
+        { label: 'Verbose traces', checked: null },
+      ])
+    })
+
+    let defaultSpanRowCount = 0
+    await retry(async () => {
+      defaultSpanRowCount = await getSpanRowCount()
+      expect(defaultSpanRowCount).toBeGreaterThan(0)
+    })
+
+    await browser
+      .elementByCss(
+        '.request-insights-settings-item:has-text("Internal activity")'
+      )
+      .click()
+
+    // Toggling keeps the menu open and reveals internal records nested under
+    // their originating request.
+    await retry(async () => {
+      const menu = await getSettingsMenuState()
+      const nestedRows = await browser.eval(() => {
+        const root = document.querySelector('nextjs-portal')?.shadowRoot
+        return Array.from(
+          root?.querySelectorAll('.request-insights-row[data-nested="true"]') ??
+            []
+        ).map((row) => ({
+          internal: row.getAttribute('data-internal'),
+          hasArrow: !!row.querySelector('.request-insights-nested-arrow'),
+          label: row.textContent ?? '',
+        }))
+      })
+
+      expect(menu.open).toBe(true)
+      expect(menu.items[0]).toEqual({
+        label: 'Internal activity',
+        checked: 'true',
+      })
+      expect(nestedRows.length).toBeGreaterThan(0)
+      for (const row of nestedRows) {
+        expect(row.internal).toBe('true')
+        expect(row.hasArrow).toBe(true)
+        expect(row.label).toContain('Instant Insights')
+      }
+    })
+
+    await browser
+      .elementByCss(
+        '.request-insights-settings-item:has-text("Verbose traces")'
+      )
+      .click()
+
+    // Verbose traces reveal spans hidden by the default trace filter.
+    await retry(async () => {
+      const menu = await getSettingsMenuState()
+
+      expect(menu.open).toBe(true)
+      expect(menu.items[1]).toEqual({
+        label: 'Verbose traces',
+        checked: 'true',
+      })
+      expect(await getSpanRowCount()).toBeGreaterThan(defaultSpanRowCount)
+    })
+
+    // Clicking outside the menu closes it.
+    await browser.elementByCss('.request-insights-details').click()
+
+    await retry(async () => {
+      const menu = await getSettingsMenuState()
+      expect(menu.open).toBe(false)
+    })
+
+    // Both toggles persist across reloads via the devtools config.
+    await browser.refresh()
+    await openRequestInsightsPanel()
+    await browser.elementByCss('.request-insights-settings-trigger').click()
+
+    await retry(async () => {
+      const menu = await getSettingsMenuState()
+
+      expect(menu.open).toBe(true)
+      expect(menu.items).toEqual([
+        { label: 'Internal activity', checked: 'true' },
+        { label: 'Verbose traces', checked: 'true' },
+      ])
     })
   })
 

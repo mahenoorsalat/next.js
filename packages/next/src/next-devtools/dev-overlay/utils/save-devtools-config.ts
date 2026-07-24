@@ -6,6 +6,11 @@ let queuedConfigPatch: DevToolsConfig = {}
 let timer: ReturnType<typeof setTimeout> | null = null
 
 function flushPatch() {
+  if (timer) {
+    clearTimeout(timer)
+    timer = null
+  }
+
   if (Object.keys(queuedConfigPatch).length === 0) {
     return
   }
@@ -44,4 +49,11 @@ export function saveDevToolsConfig(patch: DevToolsConfig) {
   }
 
   timer = setTimeout(flushPatch, 120)
+}
+
+if (typeof window !== 'undefined') {
+  // Flush any pending patch before the page goes away (e.g. reload or
+  // navigation) so a toggle right before a refresh isn't lost. The fetch in
+  // flushPatch uses keepalive, so it survives page teardown.
+  window.addEventListener('pagehide', flushPatch)
 }
