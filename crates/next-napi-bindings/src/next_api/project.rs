@@ -2432,15 +2432,15 @@ async fn get_source_map_rope(
             //
             // In the future, the VersionStateMap should track _modules_ rather than chunks, which
             // can be observed over time in a stable way, unlike chunks
-            let map_relative = format!("{chunk_base_unix}.map");
-            let server_map = node_root.join(&map_relative)?.read();
-            if server_map.await?.is_content() {
-                return Ok(server_map);
-            }
-            let client_map = client_relative_path.join(&map_relative)?.read();
-            if client_map.await?.is_content() {
-                return Ok(client_map);
-            }
+            // let map_relative = format!("{chunk_base_unix}.map");
+            // let server_map = node_root.join(&map_relative)?.read();
+            // if server_map.await?.is_content() {
+            //     return Ok(server_map);
+            // }
+            // let client_map = client_relative_path.join(&map_relative)?.read();
+            // if client_map.await?.is_content() {
+            //     return Ok(client_map);
+            // }
             bail!("chunk/module {sys_path:?} (module: {module:?}) is missing a sourcemap");
         }
     }
