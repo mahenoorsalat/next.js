@@ -492,7 +492,7 @@ function getChunkRelativeUrl(
   const encodedPath = CHUNK_PATH_NEEDS_ENCODING.test(chunkPath)
     ? chunkPath
         .split('/')
-        .map((p) => encodeURIComponent(p))
+        .map(encodeURIComponent)
         .join('/')
     : chunkPath
   return `${basePath}${encodedPath}${ASSET_SUFFIX}` as ChunkUrl
